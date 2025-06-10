@@ -552,7 +552,6 @@ func NewFallbackManager(mainConn net.PacketConn, fallbackAddr net.Addr) *Fallbac
 	cache := ttlcache.New(ttlcache.WithTTL[UDPAddrKey, net.PacketConn](fallbackIdleTimeout))
 	cache.OnEviction(func(ctx context.Context, reason ttlcache.EvictionReason, i *ttlcache.Item[UDPAddrKey, net.PacketConn]) {
 		// This function is called when a client session expires due to inactivity.
-		log.Printf("fallback session for %s timed out, closing connection", i.Key())
 		// Closing the connection will cause the corresponding forwardReplies goroutine to exit.
 		i.Value().Close()
 	})
