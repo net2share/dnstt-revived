@@ -3,12 +3,16 @@
 // Usage:
 //
 //	dnstt-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
-//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] DOMAIN UPSTREAMADDR
+//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-fallback FALLBACKADDR] DOMAIN UPSTREAMADDR
 //
 // Example:
 //
 //	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
 //	dnstt-server -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+//
+// With fallback for non-DNS traffic:
+//
+//	dnstt-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 t.example.com 127.0.0.1:8000
 //
 // To generate a persistent server private key, first run with the -gen-key
 // option. By default the generated private and public keys are printed to
@@ -31,6 +35,11 @@
 // this size at least this size will be responded to with a FORMERR. The default
 // value is maxUDPPayload.
 //
+// The -fallback option specifies a UDP address (host:port). If an incoming
+// packet is not a valid DNS message, it will be forwarded to this address.
+// This acts as a simple UDP proxy for non-DNS traffic, allowing another
+// service to run on the same port.
+//
 // DOMAIN is the root of the DNS zone reserved for the tunnel. See README for
 // instructions on setting it up.
 //
@@ -40,6 +49,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
@@ -53,6 +63,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -79,6 +90,9 @@ const (
 
 	// How long to wait for a TCP connection to upstream to be established.
 	upstreamDialTimeout = 30 * time.Second
+
+	// How long a fallback session can be idle before being torn down.
+	fallbackIdleTimeout = 2 * time.Minute
 )
 
 var (
@@ -494,11 +508,139 @@ type record struct {
 	ClientID turbotunnel.ClientID
 }
 
+// --- Fallback NAT logic for non-DNS packets ---
+
+// UDPAddrKey is a comparable struct that can be used as a map key to represent
+// a net.UDPAddr. It's designed to be highly performant by avoiding allocations.
+//
+// A net.UDPAddr cannot be a map key directly because its IP field is a slice,
+// and slices are not comparable in Go. We solve this by converting the IP
+// slice to a fixed-size [16]byte array, which is comparable. A 16-byte
+// array can hold both IPv4 and IPv6 addresses.
+type UDPAddrKey struct {
+	IP   [16]byte
+	Port int
+	Zone string // For IPv6 link-local addresses
+}
+
+// NewAddrKey converts a *net.UDPAddr into a comparable UDPAddrKey.
+// This function is designed to be allocation-free.
+func NewAddrKey(addr *net.UDPAddr) UDPAddrKey {
+	var key UDPAddrKey
+	// The IP field in UDPAddr is a slice. We copy its contents into a
+	// fixed-size 16-byte array. The IP.To16() method ensures that the
+	// IP is in a 16-byte format, suitable for both IPv4 and IPv6.
+	// This copy is the key to making the struct comparable.
+	copy(key.IP[:], addr.IP.To16())
+	key.Port = addr.Port
+	key.Zone = addr.Zone
+	return key
+}
+
+// FallbackManager handles forwarding of non-DNS UDP packets using a TTL cache
+// to manage client sessions.
+type FallbackManager struct {
+	sessions     *ttlcache.Cache[UDPAddrKey, net.PacketConn]
+	mainConn     net.PacketConn
+	fallbackAddr net.Addr
+}
+
+// NewFallbackManager creates a new manager for forwarding non-DNS packets.
+func NewFallbackManager(mainConn net.PacketConn, fallbackAddr net.Addr) *FallbackManager {
+	log.Printf("non-DNS packets will be forwarded to %s", fallbackAddr)
+
+	cache := ttlcache.New(ttlcache.WithTTL[UDPAddrKey, net.PacketConn](fallbackIdleTimeout))
+	cache.OnEviction(func(ctx context.Context, reason ttlcache.EvictionReason, i *ttlcache.Item[UDPAddrKey, net.PacketConn]) {
+		// This function is called when a client session expires due to inactivity.
+		log.Printf("fallback session for %s timed out, closing connection", i.Key())
+		// Closing the connection will cause the corresponding forwardReplies goroutine to exit.
+		i.Value().Close()
+	})
+
+	// Start a goroutine to clean up expired items from the cache periodically.
+	go cache.Start()
+
+	return &FallbackManager{
+		sessions:     cache,
+		mainConn:     mainConn,
+		fallbackAddr: fallbackAddr,
+	}
+}
+
+// HandlePacket finds or creates a fallback session for the given client address
+// and forwards the packet to the fallback server. Activity on a session (i.e.,
+// a call to this function) refreshes its timeout.
+func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
+	clientKey := NewAddrKey(clientAddr.(*net.UDPAddr))
+
+	// Get the session from the cache. This also refreshes the TTL.
+	item := m.sessions.Get(clientKey)
+	var proxyConn net.PacketConn
+
+	if item == nil {
+		// Session doesn't exist, create a new one.
+		newConn, err := net.ListenPacket("udp", ":0")
+		if err != nil {
+			log.Printf("failed to create fallback socket for %s: %v", clientKey, err)
+			return
+		}
+		proxyConn = newConn // Use the new connection
+
+		// Add the new session to the cache.
+		// The TTL is set to the default defined in the cache constructor.
+		m.sessions.Set(clientKey, newConn, ttlcache.DefaultTTL)
+		log.Printf("created new fallback session for %s via %s", clientAddr.String(), newConn.LocalAddr())
+
+		// Start a goroutine to forward replies for this new session.
+		go m.forwardReplies(newConn, clientAddr)
+
+	} else {
+		// Session exists, use the existing connection.
+		proxyConn = item.Value()
+	}
+
+	// Forward the client's packet to the fallback address.
+	_, err := proxyConn.WriteTo(packet, m.fallbackAddr)
+	if err != nil {
+		log.Printf("fallback write to %s for client %s failed: %v", m.fallbackAddr, clientKey, err)
+	}
+}
+
+// forwardReplies reads from a session's proxy connection (which receives packets
+// from the fallback server) and forwards them to the original client via the
+// main server connection. This method runs in its own goroutine for each session
+// and exits when the proxy connection is closed by the cache's eviction handler.
+func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr net.Addr) {
+	defer log.Printf("ending fallback reply forwarder for %s", clientAddr.String())
+
+	buf := make([]byte, 65535) // max UDP packet size
+	for {
+		n, _, err := proxyConn.ReadFrom(buf)
+		if err != nil {
+			// Error is expected when the connection is closed by the eviction handler.
+			// net.ErrClosed is the specific error returned in this case.
+			if !errors.Is(err, net.ErrClosed) {
+				log.Printf("fallback read from proxy conn for %s failed: %v", clientAddr, err)
+			}
+			return // Exit goroutine.
+		}
+
+		// Got a reply from the fallback server. Forward it to the original client.
+		_, writeErr := m.mainConn.WriteTo(buf[:n], clientAddr)
+		if writeErr != nil {
+			log.Printf("fallback write to client %s failed: %v", clientAddr, writeErr)
+			// If we can't write to the client, we don't need to do anything special.
+			// The session will eventually time out and be cleaned up if the client
+			// stops sending packets.
+		}
+	}
+}
+
 // recvLoop repeatedly calls dnsConn.ReadFrom, extracts the packets contained in
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
-// sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record) error {
+// sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -513,7 +655,12 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
-			log.Printf("cannot parse DNS query: %v", err)
+			if fallbackMgr != nil {
+				// Packet is not a valid DNS message, forward it if fallback is configured.
+				fallbackMgr.HandlePacket(buf[:n], addr)
+			} else {
+				log.Printf("cannot parse DNS query from %s: %v", addr, err)
+			}
 			continue
 		}
 
@@ -765,7 +912,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn) error {
+func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -805,6 +952,12 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	ch := make(chan *record, 100)
 	defer close(ch)
 
+	// Create a fallback manager if an address is specified.
+	var fallbackMgr *FallbackManager
+	if fallbackAddr != nil {
+		fallbackMgr = NewFallbackManager(dnsConn, fallbackAddr)
+	}
+
 	// We could run multiple copies of sendLoop; that would allow more time
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
@@ -815,7 +968,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch)
+	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr)
 }
 
 func main() {
@@ -824,15 +977,17 @@ func main() {
 	var privkeyString string
 	var pubkeyFilename string
 	var udpAddr string
+	var fallbackAddrString string
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  %[1]s -udp ADDR -privkey-file PRIVKEYFILE DOMAIN UPSTREAMADDR
+  %[1]s -udp ADDR -privkey-file PRIVKEYFILE [-fallback FALLBACKADDR] DOMAIN UPSTREAMADDR
 
 Example:
   %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
   %[1]s -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+  %[1]s -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 t.example.com 127.0.0.1:8000
 
 `, os.Args[0])
 		flag.PrintDefaults()
@@ -843,13 +998,14 @@ Example:
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
+	flag.StringVar(&fallbackAddrString, "fallback", "", "UDP endpoint to forward non-DNS packets to (e.g., 127.0.0.1:8888)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
 	if genKey {
 		// -gen-key mode.
-		if flag.NArg() != 0 || privkeyString != "" || udpAddr != "" {
+		if flag.NArg() != 0 || privkeyString != "" || udpAddr != "" || fallbackAddrString != "" {
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -908,6 +1064,15 @@ Example:
 			os.Exit(1)
 		}
 
+		var fallbackAddr *net.UDPAddr
+		if fallbackAddrString != "" {
+			fallbackAddr, err = net.ResolveUDPAddr("udp", fallbackAddrString)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cannot resolve fallback address %+q: %v\n", fallbackAddrString, err)
+				os.Exit(1)
+			}
+		}
+
 		if pubkeyFilename != "" {
 			fmt.Fprintf(os.Stderr, "-pubkey-file may only be used with -gen-key\n")
 			os.Exit(1)
@@ -943,7 +1108,7 @@ Example:
 			}
 		}
 
-		err = run(privkey, domain, upstream, dnsConn)
+		err = run(privkey, domain, upstream, dnsConn, fallbackAddr)
 		if err != nil {
 			log.Fatal(err)
 		}
