@@ -813,11 +813,15 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		// Now we actually send the message as a UDP packet.
 		_, err = dnsConn.WriteTo(buf, rec.Addr)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				log.Printf("WriteTo temporary error: %v", err)
-				continue
+			} else {
+				log.Printf("WriteTo error: %v", err)
 			}
-			return err
+			continue
 		}
 	}
 	return nil
