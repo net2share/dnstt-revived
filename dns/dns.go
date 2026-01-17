@@ -56,6 +56,7 @@ const (
 	// https://tools.ietf.org/html/rfc1035#section-4.1.1
 	RcodeNoError        = 0 // a.k.a. NOERROR
 	RcodeFormatError    = 1 // a.k.a. FORMERR
+	RcodeServerFailure  = 2 // a.k.a. SERVFAIL
 	RcodeNameError      = 3 // a.k.a. NXDOMAIN
 	RcodeNotImplemented = 4 // a.k.a. NOTIMPL
 	// https://tools.ietf.org/html/rfc6891#section-9

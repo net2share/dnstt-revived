@@ -1,2 +1,5 @@
 dnstt-client/dnstt-client
 dnstt-server/dnstt-server
+
+.idea
+.vscode

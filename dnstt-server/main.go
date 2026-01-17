@@ -60,7 +60,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
@@ -110,7 +112,17 @@ var (
 	// On 2020-04-19, the Quad9 resolver was seen to have a UDP payload size
 	// of 1232. Cloudflare's was 1452, and Google's was 4096.
 	maxUDPPayload = 1280 - 40 - 8
+
+	statsTotal   uint64
+	statsSuccess uint64
 )
+
+func logWithStats(format string, v ...interface{}) {
+	total := atomic.LoadUint64(&statsTotal)
+	success := atomic.LoadUint64(&statsSuccess)
+	msg := fmt.Sprintf(format, v...)
+	log.Printf("%s | Total: %d | Success: %d", msg, total, success)
+}
 
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -370,7 +382,7 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -399,7 +411,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// "If a query message with more than one OPT RR is
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
-			log.Printf("FORMERR: more than one OPT RR")
+			logWithStats("FORMERR: more than one OPT RR")
 			return resp, nil
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
@@ -419,7 +431,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
-			log.Printf("BADVERS: EDNS version %d != 0", version)
+			logWithStats("BADVERS: EDNS version %d != 0", version)
 			return resp, nil
 		}
 
@@ -436,19 +448,28 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// There must be exactly one question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
+		logWithStats("FORMERR: too few or too many questions (%d)", len(query.Question))
 		return resp, nil
 	}
 	question := query.Question[0]
-	// Check the name to see if it ends in our chosen domain, and extract
+	// Check the name to see if it ends in any of our chosen domains, and extract
 	// all that comes before the domain if it does. If it does not, we will
 	// return RcodeNameError below, but prefer to return RcodeFormatError
 	// for payload size if that applies as well.
-	prefix, ok := question.Name.TrimSuffix(domain)
-	if !ok {
+	var prefix [][]byte
+	var matchedDomain bool
+	for _, domain := range domains {
+		var ok bool
+		prefix, ok = question.Name.TrimSuffix(domain)
+		if ok {
+			matchedDomain = true
+			break
+		}
+	}
+	if !matchedDomain {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
+		logWithStats("NXDOMAIN: not authoritative for %s", question.Name)
 		return resp, nil
 	}
 	resp.Flags |= 0x0400 // AA = 1
@@ -456,7 +477,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if query.Opcode() != 0 {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
-		log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
+		logWithStats("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
 		return resp, nil
 	}
 
@@ -477,7 +498,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if err != nil {
 		// Base32 error, make like the name doesn't exist.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: base32 decoding: %v", err)
+		logWithStats("NXDOMAIN: base32 decoding: %v", err)
 		return resp, nil
 	}
 	payload = payload[:n]
@@ -490,7 +511,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// FORMERR MUST be returned."
 	if payloadSize < maxUDPPayload {
 		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
+		logWithStats("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
 		return resp, nil
 	}
 
@@ -580,7 +601,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 		// Session doesn't exist, create a new one.
 		newConn, err := net.ListenPacket("udp", ":0")
 		if err != nil {
-			log.Printf("failed to create fallback socket for %s: %v", clientKey, err)
+			log.Printf("failed to create fallback socket for %v: %v", clientKey, err)
 			return
 		}
 		proxyConn = newConn // Use the new connection
@@ -601,7 +622,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 	// Forward the client's packet to the fallback address.
 	_, err := proxyConn.WriteTo(packet, m.fallbackAddr)
 	if err != nil {
-		log.Printf("fallback write to %s for client %s failed: %v", m.fallbackAddr, clientKey, err)
+		log.Printf("fallback write to %s for client %v failed: %v", m.fallbackAddr, clientKey, err)
 	}
 }
 
@@ -639,7 +660,7 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
+func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -650,6 +671,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 			return err
 		}
+		atomic.AddUint64(&statsTotal, 1)
 
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
@@ -658,12 +680,12 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				// Packet is not a valid DNS message, forward it if fallback is configured.
 				fallbackMgr.HandlePacket(buf[:n], addr)
 			} else {
-				log.Printf("cannot parse DNS query from %s: %v", addr, err)
+				logWithStats("cannot parse DNS query from %s: %v", addr, err)
 			}
 			continue
 		}
 
-		resp, payload := responseFor(&query, domain)
+		resp, payload := responseFor(&query, domains)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -684,8 +706,12 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			// Payload is not long enough to contain a ClientID.
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
+				logWithStats("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
 			}
+		}
+
+		if resp != nil && resp.Rcode() == dns.RcodeNoError {
+			atomic.AddUint64(&statsSuccess, 1)
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
@@ -882,7 +908,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _ := responseFor(query, []dns.Name{dns.Name([][]byte{})})
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -915,7 +941,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr) error {
+func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -955,6 +981,17 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	ch := make(chan *record, 100)
 	defer close(ch)
 
+	// Log stats every 5 seconds
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			total := atomic.LoadUint64(&statsTotal)
+			success := atomic.LoadUint64(&statsSuccess)
+			log.Printf("Stats | Total: %d | Success: %d", total, success)
+		}
+	}()
+
 	// Create a fallback manager if an address is specified.
 	var fallbackMgr *FallbackManager
 	if fallbackAddr != nil {
@@ -971,7 +1008,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr)
+	return recvLoop(domains, dnsConn, ttConn, ch, fallbackMgr)
 }
 
 func main() {
@@ -1022,10 +1059,28 @@ Example:
 			flag.Usage()
 			os.Exit(1)
 		}
-		domain, err := dns.ParseName(flag.Arg(0))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", flag.Arg(0), err)
+		// Parse comma-separated domains (e.g., "d.example.com,c.example.org")
+		domainsArg := flag.Arg(0)
+		domainStrs := strings.Split(domainsArg, ",")
+		var domains []dns.Name
+		for _, domainStr := range domainStrs {
+			domainStr = strings.TrimSpace(domainStr)
+			if domainStr == "" {
+				continue
+			}
+			domain, err := dns.ParseName(domainStr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", domainStr, err)
+				os.Exit(1)
+			}
+			domains = append(domains, domain)
+		}
+		if len(domains) == 0 {
+			fmt.Fprintf(os.Stderr, "at least one domain is required\n")
 			os.Exit(1)
+		}
+		for _, domain := range domains {
+			log.Printf("serving domain: %s", domain)
 		}
 		upstream := flag.Arg(1)
 		// We keep upstream as a string in order to eventually pass it
@@ -1111,7 +1166,7 @@ Example:
 			}
 		}
 
-		err = run(privkey, domain, upstream, dnsConn, fallbackAddr)
+		err = run(privkey, domains, upstream, dnsConn, fallbackAddr)
 		if err != nil {
 			log.Fatal(err)
 		}

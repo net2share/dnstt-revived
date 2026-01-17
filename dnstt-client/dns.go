@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -42,6 +44,73 @@ const (
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
+// RateLimiter implements a token bucket rate limiter for controlling the rate
+// of DNS queries.
+type RateLimiter struct {
+	mu       sync.Mutex
+	tokens   float64
+	capacity float64
+	rate     float64 // tokens per second
+	lastTime time.Time
+}
+
+// NewRateLimiter creates a new rate limiter that allows rps requests per second.
+// If rps is 0, the limiter allows unlimited requests.
+func NewRateLimiter(rps float64) *RateLimiter {
+	if rps <= 0 {
+		return nil
+	}
+	return &RateLimiter{
+		tokens:   rps,
+		capacity: rps,
+		rate:     rps,
+		lastTime: time.Now(),
+	}
+}
+
+// Wait blocks until a token is available, then consumes one token.
+// If the limiter is nil (unlimited), it returns immediately.
+func (rl *RateLimiter) Wait() {
+	if rl == nil {
+		return
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(rl.lastTime).Seconds()
+	rl.lastTime = now
+
+	// Add tokens based on elapsed time
+	rl.tokens = rl.tokens + elapsed*rl.rate
+	if rl.tokens > rl.capacity {
+		rl.tokens = rl.capacity
+	}
+
+	// If we have at least one token, consume it
+	if rl.tokens >= 1.0 {
+		rl.tokens -= 1.0
+		return
+	}
+
+	// Otherwise, wait until we have a token
+	needed := 1.0 - rl.tokens
+	waitTime := time.Duration(needed / rl.rate * float64(time.Second))
+	rl.mu.Unlock()
+	time.Sleep(waitTime)
+	rl.mu.Lock()
+	// Recalculate tokens after sleep, in case time passed
+	now = time.Now()
+	elapsed = now.Sub(rl.lastTime).Seconds()
+	rl.tokens = elapsed * rl.rate
+	if rl.tokens > rl.capacity {
+		rl.tokens = rl.capacity
+	}
+	// Consume the token
+	rl.tokens -= 1.0
+	rl.lastTime = now
+}
+
 // DNSPacketConn provides a packet-sending and -receiving interface over various
 // forms of DNS. It handles the details of how packets and padding are encoded
 // as a DNS name in the Question section of an upstream query, and as a TXT RR
@@ -58,10 +127,28 @@ var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 // receiving a response, we ignore the ID.
 type DNSPacketConn struct {
 	clientID turbotunnel.ClientID
-	domain   dns.Name
+	domains  []dns.Name
+	// domainIndex is an atomic counter for round-robin domain selection.
+	domainIndex uint32
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+	// rateLimiter limits the rate of outgoing DNS queries.
+	rateLimiter *RateLimiter
+	// labelLen is the maximum length of each data label (1-63).
+	labelLen int
+	// numLabels is the maximum number of data labels (0 = unlimited).
+	numLabels int
+	// forgedCount tracks the number of forged DNS responses detected.
+	forgedCount uint64
+	// countSERVFAIL tracks RCODE 2 responses of forged DNS responses detected.
+	countSERVFAIL uint64
+	// countNXDOMAIN tracks RCODE 3 responses of forged DNS responses detected.
+	countNXDOMAIN uint64
+	// countSuccess tracks RCODE 0 responses.
+	countSuccess uint64
+	// countOtherError tracks other error responses.
+	countOtherError uint64
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -71,14 +158,23 @@ type DNSPacketConn struct {
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
-// transport.WriteTo whenever a message needs to be sent.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
+// transport.WriteTo whenever a message needs to be sent. rateLimiter, if not
+// nil, limits the rate of outgoing DNS queries.
+// labelLen is the max length per data label (1-63, typically 57 for anti-fingerprinting).
+// numLabels is the max number of data labels (1 = single-label mode, 0 = unlimited).
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domains []dns.Name, rateLimiter *RateLimiter, labelLen int, numLabels int) *DNSPacketConn {
+	if labelLen <= 0 || labelLen > 63 {
+		labelLen = 63
+	}
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
 		clientID:        clientID,
-		domain:          domain,
+		domains:         domains,
 		pollChan:        make(chan struct{}, pollLimit),
+		rateLimiter:     rateLimiter,
+		labelLen:        labelLen,
+		numLabels:       numLabels,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
@@ -97,38 +193,49 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 }
 
 // dnsResponsePayload extracts the downstream payload of a DNS response, encoded
-// into the RDATA of a TXT RR. It returns nil if the message doesn't pass format
-// checks, or if the name in its Question entry is not a subdomain of domain.
-func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
+// into the RDATA of a TXT RR. It returns (payload, false) on success,
+// (nil, true) if the response has error flags (likely forged by firewall),
+// or (nil, false) if the message doesn't pass other format checks.
+func dnsResponsePayload(resp *dns.Message, domains []dns.Name) ([]byte, bool) {
 	if resp.Flags&0x8000 != 0x8000 {
 		// QR != 1, this is not a response.
-		return nil
+		return nil, false
 	}
-	if resp.Flags&0x000f != dns.RcodeNoError {
-		return nil
+	rcode := resp.Flags & 0x000f
+	if rcode != dns.RcodeNoError {
+		// Non-NOERROR response - likely forged by firewall or actual error
+		return nil, true
 	}
 
 	if len(resp.Answer) != 1 {
-		return nil
+		return nil, false
 	}
 	answer := resp.Answer[0]
 
-	_, ok := answer.Name.TrimSuffix(domain)
-	if !ok {
+	// Check if the answer matches any of our domains
+	var matchedDomain bool
+	for _, domain := range domains {
+		_, ok := answer.Name.TrimSuffix(domain)
+		if ok {
+			matchedDomain = true
+			break
+		}
+	}
+	if !matchedDomain {
 		// Not the name we are expecting.
-		return nil
+		return nil, false
 	}
 
 	if answer.Type != dns.RRTypeTXT {
 		// We only support TYPE == TXT.
-		return nil
+		return nil, false
 	}
 	payload, err := dns.DecodeRDataTXT(answer.Data)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 
-	return payload
+	return payload, false
 }
 
 // nextPacket reads the next length-prefixed packet from r. It returns a nil
@@ -201,7 +308,49 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			continue
 		}
 
-		payload := dnsResponsePayload(&resp, c.domain)
+		payload, isForged := dnsResponsePayload(&resp, c.domains)
+		if isForged {
+			// Forged response detected (has error flags) - likely from firewall
+			rcode := resp.Rcode()
+			var count uint64
+			var errorType string
+
+			// Increment appropriate counter
+			switch rcode {
+			case dns.RcodeServerFailure: // 2
+				count = atomic.AddUint64(&c.countSERVFAIL, 1)
+				errorType = "SERVFAIL"
+			case dns.RcodeNameError: // 3
+				count = atomic.AddUint64(&c.countNXDOMAIN, 1)
+				errorType = "NXDOMAIN"
+			default:
+				count = atomic.AddUint64(&c.countOtherError, 1)
+				errorType = fmt.Sprintf("RCODE_%d", rcode)
+			}
+			atomic.AddUint64(&c.forgedCount, 1) // Keep total count as well
+
+			// Get current success count for context
+			successCount := atomic.LoadUint64(&c.countSuccess)
+
+			// Extract QNAME if possible
+			qname := "<unknown>"
+			if len(resp.Question) > 0 {
+				qname = resp.Question[0].Name.String()
+			}
+
+			// Calculate packet loss ratio: (all errors) / (total packets)
+			totalErrors := atomic.LoadUint64(&c.forgedCount)
+			totalPackets := successCount + totalErrors
+			lossRatio := 0.0
+			if totalPackets > 0 {
+				lossRatio = float64(totalErrors) / float64(totalPackets)
+			}
+
+			log.Printf("DNS error detected: %s (RCODE=%d) | QNAME: %s | Count: %d | Successes: %d | Loss Ratio: %f",
+				errorType, rcode, qname, count, successCount, lossRatio)
+			continue
+		}
+		atomic.AddUint64(&c.countSuccess, 1)
 
 		// Pull out the packets contained in the payload.
 		r := bytes.NewReader(payload)
@@ -256,29 +405,29 @@ func chunks(p []byte, n int) [][]byte {
 //
 //  0. Start with the raw packet contents.
 //
-//	supercalifragilisticexpialidocious
+//     supercalifragilisticexpialidocious
 //
 //  1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
 //     means a data packet of L bytes. A length prefix L ≥ 0xe0 means padding
 //     of L − 0xe0 bytes (not counting the length of the length prefix itself).
 //
-//	\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//     \xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
 //
 //  2. Prefix the ClientID.
 //
-//	CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//     CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
 //
 //  3. Base32-encode, without padding and in lower case.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
 //
 //  4. Break into labels of at most 63 octets.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
 //
 //  5. Append the domain.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	var decoded []byte
 	{
@@ -288,9 +437,36 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 		var buf bytes.Buffer
 		// ClientID
 		buf.Write(c.clientID[:])
+		// Determine padding amount - use adaptive padding when under space constraints
 		n := numPadding
 		if len(p) == 0 {
 			n = numPaddingForPoll
+		}
+		// When numLabels is limited, reduce padding to fit the packet
+		if c.numLabels > 0 {
+			// Max encoded chars = numLabels * labelLen
+			maxEncoded := c.numLabels * c.labelLen
+			// Calculate the raw capacity from maxEncoded
+			// Base32 expands 5 bytes to 8 encoded chars, so: encoded * 5 / 8 = raw
+			rawCapacity := maxEncoded * 5 / 8
+			// Fixed overhead: ClientID(8) + padding prefix(1) + padding(n) + data length prefix(1 if data) + data
+			dataLenPrefix := 0
+			if len(p) > 0 {
+				dataLenPrefix = 1
+			}
+			// Calculate how much space we need: 8 + 1 + n + dataLenPrefix + len(p)
+			// So available for padding: rawCapacity - 8 - 1 - dataLenPrefix - len(p)
+			availableForPadding := rawCapacity - 8 - 1 - dataLenPrefix - len(p)
+			if availableForPadding < n {
+				n = availableForPadding
+			}
+			// Padding must be between 0 and 31 (prefix codes 224-255)
+			if n < 0 {
+				n = 0
+			}
+			if n > 31 {
+				n = 31
+			}
 		}
 		// Padding / cache inhibition
 		buf.WriteByte(byte(224 + n))
@@ -306,8 +482,12 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 	encoded := make([]byte, base32Encoding.EncodedLen(len(decoded)))
 	base32Encoding.Encode(encoded, decoded)
 	encoded = bytes.ToLower(encoded)
-	labels := chunks(encoded, 63)
-	labels = append(labels, c.domain...)
+	// Chunk into labels using labelLen
+	labels := chunks(encoded, c.labelLen)
+	// Round-robin domain selection
+	domainIdx := atomic.AddUint32(&c.domainIndex, 1) % uint32(len(c.domains))
+	domain := c.domains[domainIdx]
+	labels = append(labels, domain...)
 	name, err := dns.NewName(labels)
 	if err != nil {
 		return err
@@ -394,6 +574,9 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			pollDelay = initPollDelay
 		}
 		pollTimer.Reset(pollDelay)
+
+		// Apply rate limiting before sending.
+		c.rateLimiter.Wait()
 
 		// Unlike in the server, in the client we assume that because
 		// the data capacity of queries is so limited, it's not worth

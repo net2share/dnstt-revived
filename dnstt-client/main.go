@@ -51,6 +51,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -64,11 +65,20 @@ import (
 // smux streams will be closed after this much time without receiving data.
 const idleTimeout = 2 * time.Minute
 
-// dnsNameCapacity returns the number of bytes remaining for encoded data after
-// including domain in a DNS name.
-func dnsNameCapacity(domain dns.Name) int {
+// dnsNameCapacity returns the number of raw bytes that can be encoded in a DNS
+// query name, given the domain suffix and encoding constraints.
+//
+// labelLen is the maximum length of each data label (1-63, typically 57 to avoid fingerprinting).
+// numLabels is the maximum number of data labels (1 = single-label mode for anti-fingerprinting).
+// If numLabels is 0, it means unlimited (use as many as DNS allows).
+func dnsNameCapacity(domain dns.Name, labelLen int, numLabels int) int {
+	if labelLen <= 0 || labelLen > 63 {
+		labelLen = 63
+	}
+
 	// Names must be 255 octets or shorter in total length.
 	// https://tools.ietf.org/html/rfc1035#section-2.3.4
+	// Calculate how much space is available after the domain suffix.
 	capacity := 255
 	// Subtract the length of the null terminator.
 	capacity -= 1
@@ -76,12 +86,22 @@ func dnsNameCapacity(domain dns.Name) int {
 		// Subtract the length of the label and the length octet.
 		capacity -= len(label) + 1
 	}
-	// Each label may be up to 63 bytes long and requires 64 bytes to
-	// encode.
-	capacity = capacity * 63 / 64
-	// Base32 expands every 5 bytes to 8.
-	capacity = capacity * 5 / 8
-	return capacity
+	// Each label requires len+1 bytes to encode (1 length byte + content).
+	// So for N labels of max length L, we use N*(L+1) wire bytes to carry N*L encoded chars.
+	// The encoded chars capacity is: capacity * L / (L + 1)
+	encodedCapacity := capacity * labelLen / (labelLen + 1)
+
+	// If numLabels is limited, cap the encoded capacity
+	if numLabels > 0 {
+		maxEncoded := numLabels * labelLen
+		if encodedCapacity > maxEncoded {
+			encodedCapacity = maxEncoded
+		}
+	}
+
+	// Base32 expands every 5 bytes to 8 chars.
+	rawCapacity := encodedCapacity * 5 / 8
+	return rawCapacity
 }
 
 // readKeyFromFile reads a key from a named file.
@@ -162,7 +182,7 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return err
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, labelLen int, numLabels int) error {
 	defer pconn.Close()
 
 	ln, err := net.ListenTCP("tcp", localAddr)
@@ -171,11 +191,35 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	defer ln.Close()
 
-	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
-	if mtu < 80 {
-		return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
+	// Calculate MTU: clientid(8) + padding prefix(1) + padding + data length prefix(1)
+	// When numLabels is limited, padding is adaptive (can be reduced to 0)
+	paddingUsed := numPadding
+	if numLabels > 0 {
+		// With limited labels, use 0 padding when space is constrained
+		paddingUsed = 0
 	}
-	log.Printf("effective MTU %d", mtu)
+	// Use the longest domain for conservative MTU calculation
+	var longestDomain dns.Name
+	for _, domain := range domains {
+		if len(domain.String()) > len(longestDomain.String()) {
+			longestDomain = domain
+		}
+	}
+	mtu := dnsNameCapacity(longestDomain, labelLen, numLabels) - 8 - 1 - paddingUsed - 1 // clientid + padding length prefix + padding + data length prefix
+	// When labels are limited, allow lower MTU (minimum 32 bytes for KCP headers)
+	// Otherwise use higher minimum for better default performance
+	minMTU := 80
+	if numLabels > 0 {
+		minMTU = 32 // KCP minimum working MTU
+	}
+	if mtu < minMTU {
+		return fmt.Errorf("domains with label-len %d and num-labels %d leaves only %d bytes for payload (minimum %d)", labelLen, numLabels, mtu, minMTU)
+	}
+	if numLabels > 0 {
+		log.Printf("effective MTU %d (label-len %d, num-labels %d)", mtu, labelLen, numLabels)
+	} else {
+		log.Printf("effective MTU %d (label-len %d)", mtu, labelLen)
+	}
 
 	// Open a KCP conn on the PacketConn.
 	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
@@ -237,6 +281,8 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 }
 
+var dialerControl func(network, address string, c syscall.RawConn) error = nil
+
 func main() {
 	var dohURL string
 	var dotAddr string
@@ -244,6 +290,7 @@ func main() {
 	var pubkeyString string
 	var udpAddr string
 	var utlsDistribution string
+	var rpsLimit float64
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -285,6 +332,15 @@ Known TLS fingerprints for -utls are:
 	flag.StringVar(&utlsDistribution, "utls",
 		"4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13",
 		"choose TLS fingerprint from weighted distribution")
+	flag.Float64Var(&rpsLimit, "rps", 0, "limit outgoing DNS queries to this many requests per second (0 = unlimited)")
+	var labelLen int
+	var numLabels int
+	var udpWorkers int
+	var udpSharedSocket bool
+	flag.IntVar(&labelLen, "label-len", 59, "maximum length of each data label (1-63)")
+	flag.IntVar(&numLabels, "num-labels", 2, "maximum number of data labels (1 = single-label, 0 = unlimited)")
+	flag.IntVar(&udpWorkers, "udp-workers", 100, "number of concurrent UDP worker goroutines")
+	flag.BoolVar(&udpSharedSocket, "udp-shared-socket", false, "use a single shared UDP socket instead of per-query sockets (disables source port randomization)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -293,10 +349,28 @@ Known TLS fingerprints for -utls are:
 		flag.Usage()
 		os.Exit(1)
 	}
-	domain, err := dns.ParseName(flag.Arg(0))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", flag.Arg(0), err)
+	// Parse comma-separated domains (e.g., "d.example.com,c.example.org")
+	domainsArg := flag.Arg(0)
+	domainStrs := strings.Split(domainsArg, ",")
+	var domains []dns.Name
+	for _, domainStr := range domainStrs {
+		domainStr = strings.TrimSpace(domainStr)
+		if domainStr == "" {
+			continue
+		}
+		domain, err := dns.ParseName(domainStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", domainStr, err)
+			os.Exit(1)
+		}
+		domains = append(domains, domain)
+	}
+	if len(domains) == 0 {
+		fmt.Fprintf(os.Stderr, "at least one domain is required\n")
 		os.Exit(1)
+	}
+	for _, domain := range domains {
+		log.Printf("using domain: %s", domain)
 	}
 	localAddr, err := net.ResolveTCPAddr("tcp", flag.Arg(1))
 	if err != nil {
@@ -384,7 +458,17 @@ Known TLS fingerprints for -utls are:
 			if err != nil {
 				return nil, nil, err
 			}
-			pconn, err := net.ListenUDP("udp", nil)
+			var pconn net.PacketConn
+			if udpSharedSocket {
+				// Old behavior: single shared UDP socket
+				lc := net.ListenConfig{
+					Control: dialerControl,
+				}
+				pconn, err = lc.ListenPacket(context.Background(), "udp", ":0")
+			} else {
+				// New behavior: multiple workers with per-query sockets
+				pconn, err = NewUDPPacketConn(addr, dialerControl, udpWorkers)
+			}
 			return addr, pconn, err
 		}},
 	} {
@@ -407,8 +491,12 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
-	err = run(pubkey, domain, localAddr, remoteAddr, pconn)
+	rateLimiter := NewRateLimiter(rpsLimit)
+	if rateLimiter != nil {
+		log.Printf("rate limiting DNS queries to %.2f requests per second", rpsLimit)
+	}
+	pconn = NewDNSPacketConn(pconn, remoteAddr, domains, rateLimiter, labelLen, numLabels)
+	err = run(pubkey, domains, localAddr, remoteAddr, pconn, labelLen, numLabels)
 	if err != nil {
 		log.Fatal(err)
 	}
