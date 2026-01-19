@@ -7,24 +7,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
 const (
-	// How many bytes of random padding to insert into queries.
-	numPadding = 3
-	// In an otherwise empty polling query, insert even more random padding,
-	// to reduce the chance of a cache hit. Cannot be greater than 31,
-	// because the prefix codes indicating padding start at 224.
-	numPaddingForPoll = 8
-
 	// sendLoop has a poll timer that automatically sends an empty polling
 	// query when a certain amount of time has elapsed without a send. The
 	// poll timer is initially set to initPollDelay. It increases by a
@@ -135,10 +128,10 @@ type DNSPacketConn struct {
 	pollChan chan struct{}
 	// rateLimiter limits the rate of outgoing DNS queries.
 	rateLimiter *RateLimiter
-	// labelLen is the maximum length of each data label (1-63).
-	labelLen int
-	// numLabels is the maximum number of data labels (0 = unlimited).
-	numLabels int
+	// maxQnameLen is the maximum total QNAME length in wire format (0 = 253 per RFC).
+	maxQnameLen int
+	// maxNumLabels is the maximum number of data labels (0 = unlimited).
+	maxNumLabels int
 	// forgedCount tracks the number of forged DNS responses detected.
 	forgedCount uint64
 	// countSERVFAIL tracks RCODE 2 responses of forged DNS responses detected.
@@ -160,11 +153,12 @@ type DNSPacketConn struct {
 // messages encoded by DNSPacketConn. addr is the address to be passed to
 // transport.WriteTo whenever a message needs to be sent. rateLimiter, if not
 // nil, limits the rate of outgoing DNS queries.
-// labelLen is the max length per data label (1-63, typically 57 for anti-fingerprinting).
-// numLabels is the max number of data labels (1 = single-label mode, 0 = unlimited).
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domains []dns.Name, rateLimiter *RateLimiter, labelLen int, numLabels int) *DNSPacketConn {
-	if labelLen <= 0 || labelLen > 63 {
-		labelLen = 63
+// maxQnameLen is the max total QNAME length (0 = 253 per RFC 1035).
+// maxNumLabels is the max number of data labels (0 = unlimited).
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domains []dns.Name, rateLimiter *RateLimiter, maxQnameLen int, maxNumLabels int) *DNSPacketConn {
+	// Default to RFC 1035 maximum if not specified
+	if maxQnameLen <= 0 || maxQnameLen > 253 {
+		maxQnameLen = 253
 	}
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
@@ -173,20 +167,20 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domains []dns.Nam
 		domains:         domains,
 		pollChan:        make(chan struct{}, pollLimit),
 		rateLimiter:     rateLimiter,
-		labelLen:        labelLen,
-		numLabels:       numLabels,
+		maxQnameLen:     maxQnameLen,
+		maxNumLabels:    maxNumLabels,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
 		err := c.recvLoop(transport)
 		if err != nil {
-			log.Printf("recvLoop: %v", err)
+			log.Errorf("recvLoop: %v", err)
 		}
 	}()
 	go func() {
 		err := c.sendLoop(transport, addr)
 		if err != nil {
-			log.Printf("sendLoop: %v", err)
+			log.Errorf("sendLoop: %v", err)
 		}
 	}()
 	return c
@@ -295,16 +289,17 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		n, addr, err := transport.ReadFrom(buf[:])
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("ReadFrom temporary error: %v", err)
+				log.Warnf("temp error: %v", err)
 				continue
 			}
 			return err
 		}
 
 		// Got a response. Try to parse it as a DNS message.
+		log.Debugf("recvLoop: got %d bytes from %s", n, addr)
 		resp, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
-			log.Printf("MessageFromWireFormat: %v", err)
+			log.Warnf("parse error: %v", err)
 			continue
 		}
 
@@ -346,11 +341,14 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 				lossRatio = float64(totalErrors) / float64(totalPackets)
 			}
 
-			log.Printf("DNS error detected: %s (RCODE=%d) | QNAME: %s | Count: %d | Successes: %d | Loss Ratio: %f",
+			log.Warnf("DNS error: %s (RCODE=%d) | QNAME: %s | Count: %d | Successes: %d | Loss Ratio: %f",
 				errorType, rcode, qname, count, successCount, lossRatio)
 			continue
 		}
 		atomic.AddUint64(&c.countSuccess, 1)
+
+		// DEBUG: Log successful response
+		log.Debugf("recv: payload=%d bytes", len(payload))
 
 		// Pull out the packets contained in the payload.
 		r := bytes.NewReader(payload)
@@ -429,64 +427,62 @@ func chunks(p []byte, n int) [][]byte {
 //
 //     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
+	const labelLen = 63 // DNS maximum label size
+
+	// Round-robin domain selection - select domain first to calculate capacity
+	domainIdx := atomic.AddUint32(&c.domainIndex, 1) % uint32(len(c.domains))
+	domain := c.domains[domainIdx]
+
+	// Calculate domain wire length (each label: 1 length byte + content)
+	domainWireLen := 0
+	for _, label := range domain {
+		domainWireLen += 1 + len(label)
+	}
+
+	// Calculate available wire bytes for data labels
+	maxQnameLen := c.maxQnameLen
+	if maxQnameLen <= 0 || maxQnameLen > 253 {
+		maxQnameLen = 253
+	}
+	availableWireBytes := maxQnameLen - domainWireLen
+	if availableWireBytes <= 0 {
+		return fmt.Errorf("domain %s is too long for max-qname-len %d", domain.String(), c.maxQnameLen)
+	}
+
+	// Calculate encoded capacity from wire bytes
+	// Each label requires L+1 wire bytes to carry L encoded chars
+	encodedCapacity := availableWireBytes * labelLen / (labelLen + 1)
+
+	// If maxNumLabels is limited, also cap the encoded capacity
+	if c.maxNumLabels > 0 {
+		maxEncoded := c.maxNumLabels * labelLen
+		if encodedCapacity > maxEncoded {
+			encodedCapacity = maxEncoded
+		}
+	}
+
 	var decoded []byte
 	{
 		if len(p) >= 224 {
 			return fmt.Errorf("too long")
 		}
 		var buf bytes.Buffer
-		// ClientID
+		// ClientID (2 bytes)
 		buf.Write(c.clientID[:])
-		// Determine padding amount - use adaptive padding when under space constraints
-		n := numPadding
-		if len(p) == 0 {
-			n = numPaddingForPoll
-		}
-		// When numLabels is limited, reduce padding to fit the packet
-		if c.numLabels > 0 {
-			// Max encoded chars = numLabels * labelLen
-			maxEncoded := c.numLabels * c.labelLen
-			// Calculate the raw capacity from maxEncoded
-			// Base32 expands 5 bytes to 8 encoded chars, so: encoded * 5 / 8 = raw
-			rawCapacity := maxEncoded * 5 / 8
-			// Fixed overhead: ClientID(8) + padding prefix(1) + padding(n) + data length prefix(1 if data) + data
-			dataLenPrefix := 0
-			if len(p) > 0 {
-				dataLenPrefix = 1
-			}
-			// Calculate how much space we need: 8 + 1 + n + dataLenPrefix + len(p)
-			// So available for padding: rawCapacity - 8 - 1 - dataLenPrefix - len(p)
-			availableForPadding := rawCapacity - 8 - 1 - dataLenPrefix - len(p)
-			if availableForPadding < n {
-				n = availableForPadding
-			}
-			// Padding must be between 0 and 31 (prefix codes 224-255)
-			if n < 0 {
-				n = 0
-			}
-			if n > 31 {
-				n = 31
-			}
-		}
-		// Padding / cache inhibition
-		buf.WriteByte(byte(224 + n))
-		io.CopyN(&buf, rand.Reader, int64(n))
-		// Packet contents
+		// Protocol: [ClientID: 2][DataLen: 1][Data] for data, [ClientID: 2] for polls
 		if len(p) > 0 {
 			buf.WriteByte(byte(len(p)))
 			buf.Write(p)
 		}
+		// For polls (len(p) == 0), send only ClientID
 		decoded = buf.Bytes()
 	}
 
 	encoded := make([]byte, base32Encoding.EncodedLen(len(decoded)))
 	base32Encoding.Encode(encoded, decoded)
 	encoded = bytes.ToLower(encoded)
-	// Chunk into labels using labelLen
-	labels := chunks(encoded, c.labelLen)
-	// Round-robin domain selection
-	domainIdx := atomic.AddUint32(&c.domainIndex, 1) % uint32(len(c.domains))
-	domain := c.domains[domainIdx]
+	// Chunk into labels using max 63 bytes per label
+	labels := chunks(encoded, labelLen)
 	labels = append(labels, domain...)
 	name, err := dns.NewName(labels)
 	if err != nil {
@@ -522,6 +518,9 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 	}
 
 	_, err = transport.WriteTo(buf, addr)
+	if err == nil {
+		log.Debugf("send: decoded=%d encoded=%d dataLen=%d", len(decoded), len(encoded), len(p))
+	}
 	return err
 }
 
@@ -583,7 +582,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		// trying to send more than one packet per query.
 		err := c.send(transport, p, addr)
 		if err != nil {
-			log.Printf("send: %v", err)
+			log.Errorf("send: %v", err)
 			continue
 		}
 	}

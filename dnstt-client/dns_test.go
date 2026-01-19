@@ -54,8 +54,10 @@ func TestNextPacket(t *testing.T) {
 }
 
 // computeQueryNameLen calculates the total length of a DNS query name
-// given encoded data length, label length, and domain labels.
-func computeQueryNameLen(encodedLen int, labelLen int, domain dns.Name) int {
+// given encoded data length, and domain labels.
+// Labels are always chunked at 63 bytes (DNS max).
+func computeQueryNameLen(encodedLen int, domain dns.Name) int {
+	const labelLen = 63
 	numLabels := (encodedLen + labelLen - 1) / labelLen // ceil(encodedLen / labelLen)
 	if numLabels == 0 {
 		numLabels = 1
@@ -68,15 +70,16 @@ func computeQueryNameLen(encodedLen int, labelLen int, domain dns.Name) int {
 }
 
 func TestLabelConstraints(t *testing.T) {
-	// Test that single-label mode produces single-label queries
+	// Test that label constraints work correctly with new parameters
+	const labelLen = 63 // DNS maximum label size
 	testCases := []struct {
-		labelLen  int
-		numLabels int
-		domainStr string
+		maxQnameLen  int
+		maxNumLabels int
+		domainStr    string
 	}{
-		{57, 1, "d.example.org"}, // single-label mode
-		{63, 1, "t.example.com"}, // max label length, single
-		{40, 2, "short.io"},      // shorter labels, two labels
+		{0, 1, "d.example.org"}, // unlimited qname, single label
+		{0, 0, "t.example.com"}, // unlimited both
+		{200, 2, "short.io"},    // limited qname length
 	}
 
 	for _, tc := range testCases {
@@ -86,19 +89,22 @@ func TestLabelConstraints(t *testing.T) {
 		}
 
 		// Calculate max encoded chars with constraints
-		maxEncoded := tc.numLabels * tc.labelLen
-
-		// Calculate query name length
-		queryNameLen := computeQueryNameLen(maxEncoded, tc.labelLen, domain)
-
-		// Verify number of labels doesn't exceed limit
-		actualLabels := (maxEncoded + tc.labelLen - 1) / tc.labelLen
-		if actualLabels > tc.numLabels {
-			t.Errorf("labelLen=%d numLabels=%d: produced %d labels, expected max %d",
-				tc.labelLen, tc.numLabels, actualLabels, tc.numLabels)
+		maxEncoded := labelLen * 4 // assume up to 4 labels for testing
+		if tc.maxNumLabels > 0 {
+			maxEncoded = tc.maxNumLabels * labelLen
 		}
 
-		t.Logf("labelLen=%d numLabels=%d domain=%s: maxEncoded=%d queryNameLen=%d",
-			tc.labelLen, tc.numLabels, tc.domainStr, maxEncoded, queryNameLen)
+		// Calculate query name length
+		queryNameLen := computeQueryNameLen(maxEncoded, domain)
+
+		// Verify number of labels doesn't exceed limit when limit is set
+		actualLabels := (maxEncoded + labelLen - 1) / labelLen
+		if tc.maxNumLabels > 0 && actualLabels > tc.maxNumLabels {
+			t.Errorf("maxQnameLen=%d maxNumLabels=%d: produced %d labels, expected max %d",
+				tc.maxQnameLen, tc.maxNumLabels, actualLabels, tc.maxNumLabels)
+		}
+
+		t.Logf("maxQnameLen=%d maxNumLabels=%d domain=%s: maxEncoded=%d queryNameLen=%d",
+			tc.maxQnameLen, tc.maxNumLabels, tc.domainStr, maxEncoded, queryNameLen)
 	}
 }

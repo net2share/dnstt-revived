@@ -56,8 +56,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"strings"
@@ -66,6 +64,7 @@ import (
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
+	log "github.com/sirupsen/logrus"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -116,13 +115,6 @@ var (
 	statsTotal   uint64
 	statsSuccess uint64
 )
-
-func logWithStats(format string, v ...interface{}) {
-	total := atomic.LoadUint64(&statsTotal)
-	success := atomic.LoadUint64(&statsSuccess)
-	msg := fmt.Sprintf(format, v...)
-	log.Printf("%s | Total: %d | Success: %d", msg, total, success)
-}
 
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -237,7 +229,7 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
+			log.Warnf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
 		}
 		upstreamTCPConn.CloseRead()
 		stream.Close()
@@ -250,7 +242,7 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
+			log.Warnf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
 		}
 		upstreamTCPConn.CloseWrite()
 	}()
@@ -287,15 +279,15 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 			}
 			return err
 		}
-		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
+		log.Infof("begin stream %08x:%d", conn.GetConv(), stream.ID())
 		go func() {
 			defer func() {
-				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
+				log.Debugf("end stream %08x:%d", conn.GetConv(), stream.ID())
 				stream.Close()
 			}()
 			err := handleStream(stream, upstream, conn.GetConv())
 			if err != nil {
-				log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				log.Warnf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
 			}
 		}()
 	}
@@ -312,7 +304,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 			}
 			return err
 		}
-		log.Printf("begin session %08x", conn.GetConv())
+		log.Infof("begin session %08x", conn.GetConv())
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
 		// Disable the dynamic congestion window (limit only by the
@@ -329,25 +321,24 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 		}
 		go func() {
 			defer func() {
-				log.Printf("end session %08x", conn.GetConv())
+				log.Debugf("end session %08x", conn.GetConv())
 				conn.Close()
 			}()
 			err := acceptStreams(conn, privkey, upstream)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
+				log.Warnf("session %08x acceptStreams: %v", conn.GetConv(), err)
 			}
 		}()
 	}
 }
 
-// nextPacket reads the next length-prefixed packet from r, ignoring padding. It
-// returns a nil error only when a packet was read successfully. It returns
-// io.EOF only when there were 0 bytes remaining to read from r. It returns
-// io.ErrUnexpectedEOF when EOF occurs in the middle of an encoded packet.
+// nextPacket reads the next length-prefixed packet from r. It returns a nil
+// error only when a packet was read successfully. It returns io.EOF only when
+// there were 0 bytes remaining to read from r. It returns io.ErrUnexpectedEOF
+// when EOF occurs in the middle of an encoded packet.
 //
-// The prefixing scheme is as follows. A length prefix L < 0xe0 means a data
-// packet of L bytes. A length prefix L >= 0xe0 means padding of L - 0xe0 bytes
-// (not counting the length of the length prefix itself).
+// The format is: a length prefix L followed by L bytes of data.
+// This is the simplified no-padding format where we removed the padding prefix.
 func nextPacket(r *bytes.Reader) ([]byte, error) {
 	// Convert io.EOF to io.ErrUnexpectedEOF.
 	eof := func(err error) error {
@@ -357,24 +348,16 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 		return err
 	}
 
-	for {
-		prefix, err := r.ReadByte()
-		if err != nil {
-			// We may return a real io.EOF only here.
-			return nil, err
-		}
-		if prefix >= 224 {
-			paddingLen := prefix - 224
-			_, err := io.CopyN(ioutil.Discard, r, int64(paddingLen))
-			if err != nil {
-				return nil, eof(err)
-			}
-		} else {
-			p := make([]byte, int(prefix))
-			_, err = io.ReadFull(r, p)
-			return p, eof(err)
-		}
+	prefix, err := r.ReadByte()
+	if err != nil {
+		// We may return a real io.EOF only here.
+		return nil, err
 	}
+	log.Debugf(" nextPacket: prefix=%d (0x%02x), remaining=%d", prefix, prefix, r.Len())
+	log.Debugf(" nextPacket: treating as data length, reading %d bytes", prefix)
+	p := make([]byte, int(prefix))
+	_, err = io.ReadFull(r, p)
+	return p, eof(err)
 }
 
 // responseFor constructs a response dns.Message that is appropriate for query.
@@ -411,7 +394,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 			// "If a query message with more than one OPT RR is
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
-			logWithStats("FORMERR: more than one OPT RR")
+			log.Debugf("FORMERR: more than one OPT RR")
 			return resp, nil
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
@@ -431,7 +414,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
-			logWithStats("BADVERS: EDNS version %d != 0", version)
+			log.Debugf("BADVERS: EDNS version %d != 0", version)
 			return resp, nil
 		}
 
@@ -448,7 +431,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 	// There must be exactly one question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
-		logWithStats("FORMERR: too few or too many questions (%d)", len(query.Question))
+		log.Debugf("FORMERR: too few or too many questions (%d)", len(query.Question))
 		return resp, nil
 	}
 	question := query.Question[0]
@@ -458,26 +441,29 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 	// for payload size if that applies as well.
 	var prefix [][]byte
 	var matchedDomain bool
+	var matchedDomainName dns.Name
 	for _, domain := range domains {
 		var ok bool
 		prefix, ok = question.Name.TrimSuffix(domain)
 		if ok {
 			matchedDomain = true
+			matchedDomainName = domain
 			break
 		}
 	}
 	if !matchedDomain {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
-		logWithStats("NXDOMAIN: not authoritative for %s", question.Name)
+		log.Debugf("NXDOMAIN: not authoritative for %s", question.Name)
 		return resp, nil
 	}
+	log.Debugf(" domain: QNAME=%s matched=%s prefixLabels=%d", question.Name.String(), matchedDomainName.String(), len(prefix))
 	resp.Flags |= 0x0400 // AA = 1
 
 	if query.Opcode() != 0 {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
-		logWithStats("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
+		log.Debugf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
 		return resp, nil
 	}
 
@@ -488,7 +474,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 		// send NS or A queries when the client only asked for a TXT. I
 		// suspect this is related to QNAME minimization, but I'm not
 		// sure. https://tools.ietf.org/html/rfc7816
-		// log.Printf("NXDOMAIN: QTYPE %d != TXT", question.Type)
+		// log.Errorf("NXDOMAIN: QTYPE %d != TXT", question.Type)
 		return resp, nil
 	}
 
@@ -498,7 +484,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 	if err != nil {
 		// Base32 error, make like the name doesn't exist.
 		resp.Flags |= dns.RcodeNameError
-		logWithStats("NXDOMAIN: base32 decoding: %v", err)
+		log.Debugf("NXDOMAIN: base32 decoding: %v", err)
 		return resp, nil
 	}
 	payload = payload[:n]
@@ -511,7 +497,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 	// FORMERR MUST be returned."
 	if payloadSize < maxUDPPayload {
 		resp.Flags |= dns.RcodeFormatError
-		logWithStats("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
+		log.Debugf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
 		return resp, nil
 	}
 
@@ -568,7 +554,7 @@ type FallbackManager struct {
 
 // NewFallbackManager creates a new manager for forwarding non-DNS packets.
 func NewFallbackManager(mainConn net.PacketConn, fallbackAddr net.Addr) *FallbackManager {
-	log.Printf("non-DNS packets will be forwarded to %s", fallbackAddr)
+	log.Infof("non-DNS packets will be forwarded to %s", fallbackAddr)
 
 	cache := ttlcache.New(ttlcache.WithTTL[UDPAddrKey, net.PacketConn](fallbackIdleTimeout))
 	cache.OnEviction(func(ctx context.Context, reason ttlcache.EvictionReason, i *ttlcache.Item[UDPAddrKey, net.PacketConn]) {
@@ -601,7 +587,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 		// Session doesn't exist, create a new one.
 		newConn, err := net.ListenPacket("udp", ":0")
 		if err != nil {
-			log.Printf("failed to create fallback socket for %v: %v", clientKey, err)
+			log.Errorf("failed to create fallback socket for %v: %v", clientKey, err)
 			return
 		}
 		proxyConn = newConn // Use the new connection
@@ -609,7 +595,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 		// Add the new session to the cache.
 		// The TTL is set to the default defined in the cache constructor.
 		m.sessions.Set(clientKey, newConn, ttlcache.DefaultTTL)
-		log.Printf("created new fallback session for %s via %s", clientAddr.String(), newConn.LocalAddr())
+		log.Infof("created new fallback session for %s via %s", clientAddr.String(), newConn.LocalAddr())
 
 		// Start a goroutine to forward replies for this new session.
 		go m.forwardReplies(newConn, clientAddr)
@@ -622,7 +608,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 	// Forward the client's packet to the fallback address.
 	_, err := proxyConn.WriteTo(packet, m.fallbackAddr)
 	if err != nil {
-		log.Printf("fallback write to %s for client %v failed: %v", m.fallbackAddr, clientKey, err)
+		log.Errorf("fallback write to %s for client %v failed: %v", m.fallbackAddr, clientKey, err)
 	}
 }
 
@@ -631,7 +617,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 // main server connection. This method runs in its own goroutine for each session
 // and exits when the proxy connection is closed by the cache's eviction handler.
 func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr net.Addr) {
-	defer log.Printf("ending fallback reply forwarder for %s", clientAddr.String())
+	defer log.Infof("ending fallback reply forwarder for %s", clientAddr.String())
 
 	buf := make([]byte, 65535) // max UDP packet size
 	for {
@@ -640,7 +626,7 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 			// Error is expected when the connection is closed by the eviction handler.
 			// net.ErrClosed is the specific error returned in this case.
 			if !errors.Is(err, net.ErrClosed) {
-				log.Printf("fallback read from proxy conn for %s failed: %v", clientAddr, err)
+				log.Errorf("fallback read from proxy conn for %s failed: %v", clientAddr, err)
 			}
 			return // Exit goroutine.
 		}
@@ -648,7 +634,7 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 		// Got a reply from the fallback server. Forward it to the original client.
 		_, writeErr := m.mainConn.WriteTo(buf[:n], clientAddr)
 		if writeErr != nil {
-			log.Printf("fallback write to client %s failed: %v", clientAddr, writeErr)
+			log.Errorf("fallback write to client %s failed: %v", clientAddr, writeErr)
 			// If we can't write to the client, we don't need to do anything special.
 			// The session will eventually time out and be cleaned up if the client
 			// stops sending packets.
@@ -666,7 +652,7 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 		n, addr, err := dnsConn.ReadFrom(buf[:])
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("ReadFrom temporary error: %v", err)
+				log.Warnf("ReadFrom temporary error: %v", err)
 				continue
 			}
 			return err
@@ -680,33 +666,43 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 				// Packet is not a valid DNS message, forward it if fallback is configured.
 				fallbackMgr.HandlePacket(buf[:n], addr)
 			} else {
-				logWithStats("cannot parse DNS query from %s: %v", addr, err)
+				log.Debugf("cannot parse DNS query from %s: %v", addr, err)
 			}
 			continue
 		}
 
 		resp, payload := responseFor(&query, domains)
+		// DEBUG: Log payload
+		log.Debugf(" recv: payload=%d bytes from %s", len(payload), addr)
+
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
 		payload = payload[n:]
+		log.Debugf(": ClientID extraction: copied=%d expected=%d remaining=%d", n, len(clientID), len(payload))
+
 		if n == len(clientID) {
 			// Discard padding and pull out the packets contained in
 			// the payload.
 			r := bytes.NewReader(payload)
+			packetCount := 0
 			for {
 				p, err := nextPacket(r)
 				if err != nil {
+					log.Debugf(": nextPacket error: %v (after %d packets)", err, packetCount)
 					break
 				}
+				packetCount++
+				log.Debugf(": queuing packet %d, len=%d for client %s", packetCount, len(p), clientID.String())
 				// Feed the incoming packet to KCP.
 				ttConn.QueueIncoming(p, clientID)
 			}
 		} else {
 			// Payload is not long enough to contain a ClientID.
+			log.Debugf(": payload too short for ClientID: got %d bytes, need %d", n, len(clientID))
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
-				logWithStats("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
+				log.Debugf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
 			}
 		}
 
@@ -825,13 +821,13 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 		buf, err := rec.Resp.WireFormat()
 		if err != nil {
-			log.Printf("resp WireFormat: %v", err)
+			log.Errorf("resp WireFormat: %v", err)
 			continue
 		}
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
 		if len(buf) > maxUDPPayload {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
+			log.Warnf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
 			buf = buf[:maxUDPPayload]
 			buf[2] |= 0x02 // TC = 1
 		}
@@ -843,9 +839,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				return err
 			}
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("WriteTo temporary error: %v", err)
+				log.Warnf("WriteTo temporary error: %v", err)
 			} else {
-				log.Printf("WriteTo error: %v", err)
+				log.Warnf("WriteTo error: %v", err)
 			}
 			continue
 		}
@@ -944,7 +940,7 @@ func computeMaxEncodedPayload(limit int) int {
 func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr) error {
 	defer dnsConn.Close()
 
-	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
+	log.Infof("pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
 	// We have a variable amount of room in which to encode downstream
 	// packets in each response, because each response must contain the
@@ -962,7 +958,7 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 		}
 		return fmt.Errorf("maximum UDP payload size of %d leaves only %d bytes for payload", maxUDPPayload, mtu)
 	}
-	log.Printf("effective MTU %d", mtu)
+	log.Infof("effective MTU %d", mtu)
 
 	// Start up the virtual PacketConn for turbotunnel.
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
@@ -974,7 +970,7 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 	go func() {
 		err := acceptSessions(ln, privkey, mtu, upstream)
 		if err != nil {
-			log.Printf("acceptSessions: %v", err)
+			log.Warnf("acceptSessions: %v", err)
 		}
 	}()
 
@@ -988,7 +984,7 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 		for range ticker.C {
 			total := atomic.LoadUint64(&statsTotal)
 			success := atomic.LoadUint64(&statsSuccess)
-			log.Printf("Stats | Total: %d | Success: %d", total, success)
+			log.Infof("Stats | Total: %d | Success: %d", total, success)
 		}
 	}()
 
@@ -1004,7 +1000,7 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 	go func() {
 		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
 		if err != nil {
-			log.Printf("sendLoop: %v", err)
+			log.Warnf("sendLoop: %v", err)
 		}
 	}()
 
@@ -1039,9 +1035,20 @@ Example:
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
 	flag.StringVar(&fallbackAddrString, "fallback", "", "UDP endpoint to forward non-DNS packets to (e.g., 127.0.0.1:8888)")
+	var logLevel string
+	flag.StringVar(&logLevel, "log-level", "warning", "log level (debug, info, warning, error)")
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.LUTC)
+	// Configure logrus
+	level, err := log.ParseLevel(logLevel)
+	if err != nil {
+		log.Fatalf("invalid log level: %v", err)
+	}
+	log.SetLevel(level)
+	log.SetFormatter(&log.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+	})
 
 	if genKey {
 		// -gen-key mode.
@@ -1080,7 +1087,7 @@ Example:
 			os.Exit(1)
 		}
 		for _, domain := range domains {
-			log.Printf("serving domain: %s", domain)
+			log.Infof("serving domain: %s", domain)
 		}
 		upstream := flag.Arg(1)
 		// We keep upstream as a string in order to eventually pass it
@@ -1101,7 +1108,7 @@ Example:
 				// Failure to resolve the host portion is only a
 				// warning. The name will be re-resolved on each
 				// net.Dial in handleStream.
-				log.Printf("warning: cannot resolve upstream host %+q: %v", upstreamHost, err)
+				log.Warnf("cannot resolve upstream host %+q: %v", upstreamHost, err)
 			} else if upstreamIPAddr.IP == nil {
 				// Handle the special case of an empty string
 				// for the host portion, which resolves to a nil
