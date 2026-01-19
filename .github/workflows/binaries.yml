@@ -3,6 +3,7 @@ name: build binaries
 on:
   push:
     tags: [ 'v*' ]
+    branches: [ 'dev' ]
   pull_request:
   workflow_dispatch:
 
