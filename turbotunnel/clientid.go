@@ -13,7 +13,10 @@ import (
 // client session. The client attaches its ClientID to each of its
 // communications, enabling the server to disambiguate requests among its many
 // clients. ClientID implements the net.Addr interface.
-type ClientID [8]byte
+//
+// Reduced from 8 bytes to 2 bytes to minimize overhead for constrained DNS tunnels.
+// 2 bytes = 65536 unique IDs, sufficient for most deployments.
+type ClientID [2]byte
 
 func NewClientID() ClientID {
 	var id ClientID
