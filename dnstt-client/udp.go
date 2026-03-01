@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
@@ -79,20 +80,37 @@ func (c *UDPPacketConn) sendLoop() {
 			continue
 		}
 
-		// Wait for a response on this socket, with a timeout.
-		conn.SetReadDeadline(time.Now().Add(udpResponseTimeout))
+		// Read responses on this socket until we get a valid one or
+		// timeout. This loop exists to skip past forged responses
+		// (e.g. SERVFAIL/REFUSED injected by censorship) and wait
+		// for the real response from the resolver.
+		deadline := time.Now().Add(udpResponseTimeout)
+		conn.SetReadDeadline(deadline)
 		var buf [4096]byte
-		n, _, err := conn.ReadFrom(buf[:])
-		conn.Close()
+		for {
+			n, _, err := conn.ReadFrom(buf[:])
+			if err != nil {
+				// Timeout or other error.
+				break
+			}
 
-		if err != nil {
-			// Timeout or other error. This is expected for some queries
-			// that don't receive responses, so we don't log it.
-			continue
+			// Quick RCODE check: if the response has an error
+			// RCODE, it's likely injected by a censor. Skip it
+			// and keep waiting for the real response.
+			resp, parseErr := dns.MessageFromWireFormat(buf[:n])
+			if parseErr == nil && resp.Flags&0x8000 != 0 {
+				// It's a response (QR=1). Check RCODE.
+				rcode := resp.Rcode()
+				if rcode != dns.RcodeNoError {
+					log.Printf("UDP: skipping injected response (RCODE=%d), waiting for real response", rcode)
+					continue
+				}
+			}
+
+			// Valid response (RCODE=0) or unparseable — queue it.
+			c.QueuePacketConn.QueueIncoming(buf[:n], c.remoteAddr)
+			break
 		}
-
-		// Queue the response. Use c.remoteAddr since that's where we sent
-		// the query to and where the response comes from.
-		c.QueuePacketConn.QueueIncoming(buf[:n], c.remoteAddr)
+		conn.Close()
 	}
 }
