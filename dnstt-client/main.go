@@ -343,7 +343,7 @@ Known TLS fingerprints for -utls are:
 	var udpWorkers int
 	var udpSharedSocket bool
 	var logLevel string
-	flag.IntVar(&maxQnameLen, "max-qname-len", 0, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
+	flag.IntVar(&maxQnameLen, "max-qname-len", 101, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
 	flag.IntVar(&maxNumLabels, "max-num-labels", 0, "maximum number of data labels (0 = unlimited)")
 	flag.IntVar(&udpWorkers, "udp-workers", 100, "number of concurrent UDP worker goroutines")
 	flag.BoolVar(&udpSharedSocket, "udp-shared-socket", false, "use a single shared UDP socket instead of per-query sockets (disables source port randomization)")
