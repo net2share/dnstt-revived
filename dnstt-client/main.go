@@ -64,8 +64,8 @@ import (
 
 // Default timeout values, overridable via CLI flags.
 const (
-	defaultIdleTimeout        = 10 * time.Second
-	defaultKeepAlive          = 2 * time.Second
+	defaultIdleTimeout        = 4 * time.Second
+	defaultKeepAlive          = 1 * time.Second
 	defaultUDPResponseTimeout = 200 * time.Millisecond
 )
 
@@ -148,7 +148,7 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 	return ids[sampleWeighted(weights)], nil
 }
 
-const openStreamTimeout = 10 * time.Second
+const openStreamTimeout = 3 * time.Second
 
 // errOpenStreamTimeout is a sentinel error returned by handle when
 // OpenStream hangs, indicating the session is likely dead/zombie.
@@ -274,10 +274,10 @@ func createTunnelSession(pconn net.PacketConn, remoteAddr net.Addr, pubkey []byt
 
 const (
 	// How often to check session health when no new connections arrive.
-	sessionCheckInterval = 1 * time.Second
+	sessionCheckInterval = 500 * time.Millisecond
 
 	// Reconnection backoff parameters.
-	reconnectInitDelay = 5 * time.Second
+	reconnectInitDelay = 1 * time.Second
 	reconnectMaxDelay  = 2 * time.Minute
 )
 
@@ -463,7 +463,7 @@ Known TLS fingerprints for -utls are:
 	var idleTimeoutStr string
 	var keepAliveStr string
 	var udpTimeoutStr string
-	var udpIgnoreErrors bool
+	var udpAcceptErrors bool
 	var maxStreams int
 	flag.IntVar(&maxStreams, "max-streams", 256, "maximum number of concurrent streams (0 = unlimited)")
 	flag.IntVar(&maxQnameLen, "max-qname-len", 101, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
@@ -484,11 +484,12 @@ Known TLS fingerprints for -utls are:
 	// udp-timeout: how long each UDP worker waits for a DNS response after
 	// sending a query. If no response arrives, the query is considered lost.
 	flag.StringVar(&udpTimeoutStr, "udp-timeout", defaultUDPResponseTimeout.String(), "per-query UDP response timeout (e.g. 2s, 500ms)")
-	// udp-ignore-errors: when true, non-NOERROR DNS responses (SERVFAIL,
-	// NXDOMAIN, REFUSED, etc.) are silently dropped, assuming they are
-	// forged by censorship. The worker keeps waiting for a real response
-	// until udp-timeout. When false, all responses are passed through.
-	flag.BoolVar(&udpIgnoreErrors, "udp-ignore-errors", true, "ignore DNS error responses in UDP mode (filter forged/censored replies)")
+	// udp-accept-errors: when given, non-NOERROR DNS responses (SERVFAIL,
+	// NXDOMAIN, REFUSED, etc.) are passed through instead of being dropped.
+	// By default (flag not given), error responses are silently dropped,
+	// assuming they are forged by censorship, and the worker keeps waiting
+	// for a real response until udp-timeout.
+	flag.BoolVar(&udpAcceptErrors, "udp-accept-errors", false, "accept DNS error responses instead of filtering them (disables censorship evasion)")
 	flag.StringVar(&domainArg, "domain", "", "tunnel domain (e.g., t.example.com)")
 	flag.StringVar(&listenAddr, "listen", "", "TCP address to listen on for local connections (e.g., 127.0.0.1:7000)")
 	flag.Parse()
@@ -638,7 +639,7 @@ Known TLS fingerprints for -utls are:
 				pconn, err = lc.ListenPacket(context.Background(), "udp", ":0")
 			} else {
 				// New behavior: multiple workers with per-query sockets
-				pconn, err = NewUDPPacketConn(addr, dialerControl, udpWorkers, udpTimeout, udpIgnoreErrors)
+				pconn, err = NewUDPPacketConn(addr, dialerControl, udpWorkers, udpTimeout, !udpAcceptErrors)
 			}
 			return addr, pconn, err
 		}},
