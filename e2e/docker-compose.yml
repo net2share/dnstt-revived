@@ -83,6 +83,7 @@ services:
       - -c
       - |
         dd if=/dev/urandom of=/usr/share/nginx/html/bigfile bs=1M count=10
+        dd if=/dev/urandom of=/usr/share/nginx/html/bigfile2 bs=1M count=10
         exec nginx -g 'daemon off;'
 
   server-socks:
