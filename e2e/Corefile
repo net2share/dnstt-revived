@@ -2,3 +2,8 @@ t.example.com {
     forward . 172.28.0.20
     log
 }
+
+s.example.com {
+    forward . 172.28.0.30
+    log
+}
