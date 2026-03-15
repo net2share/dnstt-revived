@@ -150,10 +150,6 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 
 const openStreamTimeout = 3 * time.Second
 
-// errOpenStreamTimeout is a sentinel error returned by handle when
-// OpenStream hangs, indicating the session is likely dead/zombie.
-var errOpenStreamTimeout = errors.New("OpenStream timed out")
-
 type streamResult struct {
 	stream *smux.Stream
 	err    error
@@ -173,16 +169,21 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 		}
 		stream = r.stream
 	case <-time.After(openStreamTimeout):
-		// Force-close the session so the leaked OpenStream goroutine
-		// unblocks and returns, and so the inner loop detects death.
-		sess.Close()
-		return fmt.Errorf("session %08x opening stream: %w", conv, errOpenStreamTimeout)
+		// Clean up the leaked OpenStream goroutine: if it eventually
+		// succeeds, close the stream so it doesn't leak on the server.
+		go func() {
+			r := <-ch
+			if r.stream != nil {
+				r.stream.Close()
+			}
+		}()
+		return fmt.Errorf("session %08x opening stream: timed out after %v", conv, openStreamTimeout)
 	}
 	defer func() {
 		log.Debugf("end stream %08x:%d", conv, stream.ID())
 		stream.Close()
 	}()
-	log.Infof("begin stream %08x:%d", conv, stream.ID())
+	log.Debugf("begin stream %08x:%d", conv, stream.ID())
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -385,11 +386,6 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 				err := handle(local.(*net.TCPConn), sess, conn.GetConv())
 				if err != nil {
 					log.Errorf("handle: %v", err)
-					if errors.Is(err, errOpenStreamTimeout) {
-						// handle() already called sess.Close(),
-						// sessDone will fire on next health check.
-						log.Warnf("OpenStream timeout forced session close, reconnect imminent")
-					}
 				}
 			}()
 		}
