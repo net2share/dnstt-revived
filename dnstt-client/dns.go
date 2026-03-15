@@ -32,6 +32,15 @@ const (
 	// A limit on the number of empty poll requests we may send in a burst
 	// as a result of receiving data.
 	pollLimit = 16
+
+	// pollNonceLen is the number of random bytes appended to empty poll
+	// queries to prevent DNS resolver caching. Without this, all polls
+	// from a given ClientID encode to the same QNAME, and resolvers
+	// return stale cached responses for up to TTL seconds. The nonce
+	// bytes are harmlessly ignored by the server (they form "packets"
+	// too short for KCP to process). Data-carrying queries don't need
+	// a nonce because their payload already makes each QNAME unique.
+	pollNonceLen = 4
 )
 
 // base32Encoding is a base32 encoding without padding.
@@ -67,41 +76,28 @@ func (rl *RateLimiter) Wait() {
 	if rl == nil {
 		return
 	}
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	now := time.Now()
-	elapsed := now.Sub(rl.lastTime).Seconds()
-	rl.lastTime = now
-
-	// Add tokens based on elapsed time
-	rl.tokens = rl.tokens + elapsed*rl.rate
-	if rl.tokens > rl.capacity {
-		rl.tokens = rl.capacity
+	for {
+		rl.mu.Lock()
+		now := time.Now()
+		elapsed := now.Sub(rl.lastTime).Seconds()
+		rl.lastTime = now
+		rl.tokens += elapsed * rl.rate
+		if rl.tokens > rl.capacity {
+			rl.tokens = rl.capacity
+		}
+		if rl.tokens >= 1.0 {
+			rl.tokens -= 1.0
+			rl.mu.Unlock()
+			return
+		}
+		// Not enough tokens; compute wait time, release lock, sleep,
+		// and retry. Another goroutine may consume tokens during our
+		// sleep, so we must re-check after waking.
+		needed := 1.0 - rl.tokens
+		waitTime := time.Duration(needed / rl.rate * float64(time.Second))
+		rl.mu.Unlock()
+		time.Sleep(waitTime)
 	}
-
-	// If we have at least one token, consume it
-	if rl.tokens >= 1.0 {
-		rl.tokens -= 1.0
-		return
-	}
-
-	// Otherwise, wait until we have a token
-	needed := 1.0 - rl.tokens
-	waitTime := time.Duration(needed / rl.rate * float64(time.Second))
-	rl.mu.Unlock()
-	time.Sleep(waitTime)
-	rl.mu.Lock()
-	// Recalculate tokens after sleep, in case time passed
-	now = time.Now()
-	elapsed = now.Sub(rl.lastTime).Seconds()
-	rl.tokens = elapsed * rl.rate
-	if rl.tokens > rl.capacity {
-		rl.tokens = rl.capacity
-	}
-	// Consume the token
-	rl.tokens -= 1.0
-	rl.lastTime = now
 }
 
 // DNSPacketConn provides a packet-sending and -receiving interface over various
@@ -393,39 +389,17 @@ func chunks(p []byte, n int) [][]byte {
 // send sends p as a single packet encoded into a DNS query, using
 // transport.WriteTo(query, addr). The length of p must be less than 224 bytes.
 //
-// Here is an example of how a packet is encoded into a DNS name, using
+// For data packets (len(p) > 0), the encoding is:
 //
-//	p = "supercalifragilisticexpialidocious"
-//	c.clientID = "CLIENTID"
-//	domain = "t.example.com"
+//  1. [ClientID:2][DataLen:1][Data] → base32 → split into 63-byte labels → append domain.
 //
-// as the input.
+// For poll queries (len(p) == 0), the encoding is:
 //
-//  0. Start with the raw packet contents.
+//  1. [ClientID:2][Nonce:4] → base32 → split into 63-byte labels → append domain.
 //
-//     supercalifragilisticexpialidocious
-//
-//  1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
-//     means a data packet of L bytes. A length prefix L ≥ 0xe0 means padding
-//     of L − 0xe0 bytes (not counting the length of the length prefix itself).
-//
-//     \xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
-//
-//  2. Prefix the ClientID.
-//
-//     CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
-//
-//  3. Base32-encode, without padding and in lower case.
-//
-//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
-//
-//  4. Break into labels of at most 63 octets.
-//
-//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
-//
-//  5. Append the domain.
-//
-//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+// The nonce in poll queries prevents DNS resolver caching by making each
+// poll QNAME unique. The server ignores the nonce bytes because they form
+// "packets" too short for KCP to process (KCP minimum header is 24 bytes).
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	const labelLen = 63 // DNS maximum label size
 
@@ -469,12 +443,15 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 		var buf bytes.Buffer
 		// ClientID (2 bytes)
 		buf.Write(c.clientID[:])
-		// Protocol: [ClientID: 2][DataLen: 1][Data] for data, [ClientID: 2] for polls
 		if len(p) > 0 {
+			// Data packet: [ClientID:2][DataLen:1][Data]
 			buf.WriteByte(byte(len(p)))
 			buf.Write(p)
+		} else {
+			// Poll: [ClientID:2][Nonce:pollNonceLen]
+			// Random nonce prevents DNS resolver caching.
+			io.CopyN(&buf, rand.Reader, pollNonceLen)
 		}
-		// For polls (len(p) == 0), send only ClientID
 		decoded = buf.Bytes()
 	}
 

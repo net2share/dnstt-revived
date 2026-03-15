@@ -17,7 +17,7 @@
 //	-udp resolver.example:53
 //
 // You can give the server's public key as a file or as a hex string. Use
-// "dnstt-server -gen-key"to get the public key.
+// "dnstt-server -gen-key" to get the public key.
 //
 //	-pubkey-file server.pub
 //	-pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
@@ -31,7 +31,7 @@
 // In -doh and -dot modes, the program's TLS fingerprint is camouflaged with
 // uTLS by default. The specific TLS fingerprint is selected randomly from a
 // weighted distribution. You can set your own distribution (or specific single
-// fingerprint) using the -utls option. The special value "none"disables uTLS.
+// fingerprint) using the -utls option. The special value "none" disables uTLS.
 //
 //	-utls '3*Firefox,2*Chrome,1*iOS'
 //	-utls Firefox
@@ -62,8 +62,11 @@ import (
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
-// smux streams will be closed after this much time without receiving data.
-const idleTimeout = 2 * time.Minute
+// Default timeout values, overridable via CLI flags.
+const (
+	defaultIdleTimeout        = 10 * time.Second
+	defaultUDPResponseTimeout = 2 * time.Second
+)
 
 // dnsNameCapacity returns the number of raw bytes that can be encoded in a DNS
 // query name, given the domain suffix and encoding constraints.
@@ -187,7 +190,68 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return err
 }
 
-func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int) error {
+// createTunnelSession creates a new KCP + Noise + smux session on top of the
+// given packet conn. The caller is responsible for closing the returned session
+// and KCP connection.
+func createTunnelSession(pconn net.PacketConn, remoteAddr net.Addr, pubkey []byte, mtu int, idleTimeout time.Duration) (*kcp.UDPSession, *smux.Session, error) {
+	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening KCP conn: %v", err)
+	}
+	log.Infof("begin session %08x", conn.GetConv())
+	// Permit coalescing the payloads of consecutive sends.
+	conn.SetStreamMode(true)
+	// Disable the dynamic congestion window (limit only by the maximum of
+	// local and remote static windows).
+	conn.SetNoDelay(
+		0, // default nodelay
+		0, // default interval
+		0, // default resend
+		1, // nc=1 => congestion window off
+	)
+	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	if rc := conn.SetMtu(mtu); !rc {
+		conn.Close()
+		return nil, nil, fmt.Errorf("failed to set KCP MTU to %d (KCP internal error)", mtu)
+	}
+
+	// Put a Noise channel on top of the KCP conn.
+	log.Debugf("starting Noise handshake...")
+	rw, err := noise.NewClient(conn, pubkey)
+	if err != nil {
+		log.Debugf("Noise handshake failed: %v", err)
+		conn.Close()
+		return nil, nil, fmt.Errorf("noise handshake: %v", err)
+	}
+	log.Debugf("Noise handshake completed successfully")
+
+	// Start a smux session on the Noise channel.
+	log.Debugf("creating smux session...")
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.Version = 2
+	smuxConfig.KeepAliveTimeout = idleTimeout
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	sess, err := smux.Client(rw, smuxConfig)
+	if err != nil {
+		log.Debugf("smux session creation failed: %v", err)
+		conn.Close()
+		return nil, nil, fmt.Errorf("opening smux session: %v", err)
+	}
+	log.Debugf("smux session created successfully")
+
+	return conn, sess, nil
+}
+
+const (
+	// How often to check session health when no new connections arrive.
+	sessionCheckInterval = 5 * time.Second
+
+	// Reconnection backoff parameters.
+	reconnectInitDelay = 5 * time.Second
+	reconnectMaxDelay  = 2 * time.Minute
+)
+
+func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration) error {
 	defer pconn.Close()
 
 	ln, err := net.ListenTCP("tcp", localAddr)
@@ -220,69 +284,72 @@ func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr n
 		log.Infof("effective MTU %d", mtu)
 	}
 
-	// Open a KCP conn on the PacketConn.
-	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
-	if err != nil {
-		return fmt.Errorf("opening KCP conn: %v", err)
-	}
-	defer func() {
-		log.Debugf("end session %08x", conn.GetConv())
-		conn.Close()
-	}()
-	log.Infof("begin session %08x", conn.GetConv())
-	// Permit coalescing the payloads of consecutive sends.
-	conn.SetStreamMode(true)
-	// Disable the dynamic congestion window (limit only by the maximum of
-	// local and remote static windows).
-	conn.SetNoDelay(
-		0, // default nodelay
-		0, // default interval
-		0, // default resend
-		1, // nc=1 => congestion window off
-	)
-	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-	if rc := conn.SetMtu(mtu); !rc {
-		return fmt.Errorf("failed to set KCP MTU to %d (KCP internal error)", mtu)
-	}
-
-	// Put a Noise channel on top of the KCP conn.
-	log.Debugf("starting Noise handshake...")
-	rw, err := noise.NewClient(conn, pubkey)
-	if err != nil {
-		log.Debugf("Noise handshake failed: %v", err)
-		return err
-	}
-	log.Debugf("Noise handshake completed successfully")
-
-	// Start a smux session on the Noise channel.
-	log.Debugf("creating smux session...")
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
-	sess, err := smux.Client(rw, smuxConfig)
-	if err != nil {
-		log.Debugf("smux session creation failed: %v", err)
-		return fmt.Errorf("opening smux session: %v", err)
-	}
-	log.Debugf("smux session created successfully")
-	defer sess.Close()
-
+	// Outer loop: manages tunnel session lifecycle with automatic reconnection.
+	// The TCP listener stays open across reconnections so the listen port
+	// remains stable for SOCKS clients.
 	for {
-		local, err := ln.Accept()
-		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
+		// Establish tunnel session, retrying with exponential backoff.
+		var conn *kcp.UDPSession
+		var sess *smux.Session
+		delay := reconnectInitDelay
+		for {
+			conn, sess, err = createTunnelSession(pconn, remoteAddr, pubkey, mtu, idleTimeout)
+			if err == nil {
+				break
+			}
+			log.Warnf("tunnel session creation failed: %v, retrying in %v", err, delay)
+			time.Sleep(delay)
+			delay *= 2
+			if delay > reconnectMaxDelay {
+				delay = reconnectMaxDelay
+			}
+		}
+
+		// Inner loop: accept local connections and proxy them through the
+		// current session. Periodically check if the session is still alive.
+		sessionAlive := true
+		for sessionAlive {
+			ln.SetDeadline(time.Now().Add(sessionCheckInterval))
+			local, err := ln.Accept()
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					// Periodic health check.
+					if sess.IsClosed() {
+						log.Warnf("tunnel session %08x died, reconnecting...", conn.GetConv())
+						sessionAlive = false
+					}
+					continue
+				}
+				if ne, ok := err.(net.Error); ok && ne.Temporary() {
+					continue
+				}
+				// Fatal listener error.
+				sess.Close()
+				conn.Close()
+				return err
+			}
+
+			// Check session before spawning handler.
+			if sess.IsClosed() {
+				local.Close()
+				log.Warnf("tunnel session %08x died, reconnecting...", conn.GetConv())
+				sessionAlive = false
 				continue
 			}
-			return err
+
+			go func() {
+				defer local.Close()
+				err := handle(local.(*net.TCPConn), sess, conn.GetConv())
+				if err != nil {
+					log.Errorf("handle: %v", err)
+				}
+			}()
 		}
-		go func() {
-			defer local.Close()
-			err := handle(local.(*net.TCPConn), sess, conn.GetConv())
-			if err != nil {
-				log.Errorf("handle: %v", err)
-			}
-		}()
+
+		// Clean up dead session before reconnecting.
+		log.Debugf("end session %08x", conn.GetConv())
+		sess.Close()
+		conn.Close()
 	}
 }
 
@@ -318,11 +385,11 @@ Known TLS fingerprints for -utls are:
 		i := 0
 		for i < len(labels) {
 			var line strings.Builder
-			fmt.Fprintf(&line, " %s", labels[i])
+			fmt.Fprintf(&line, "  %s", labels[i])
 			w := 2 + len(labels[i])
 			i++
 			for i < len(labels) && w+1+len(labels[i]) <= 72 {
-				fmt.Fprintf(&line, "%s", labels[i])
+				fmt.Fprintf(&line, " %s", labels[i])
 				w += 1 + len(labels[i])
 				i++
 			}
@@ -343,11 +410,28 @@ Known TLS fingerprints for -utls are:
 	var udpWorkers int
 	var udpSharedSocket bool
 	var logLevel string
+	var idleTimeoutStr string
+	var udpTimeoutStr string
+	var udpIgnoreErrors bool
 	flag.IntVar(&maxQnameLen, "max-qname-len", 101, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
 	flag.IntVar(&maxNumLabels, "max-num-labels", 0, "maximum number of data labels (0 = unlimited)")
 	flag.IntVar(&udpWorkers, "udp-workers", 100, "number of concurrent UDP worker goroutines")
 	flag.BoolVar(&udpSharedSocket, "udp-shared-socket", false, "use a single shared UDP socket instead of per-query sockets (disables source port randomization)")
 	flag.StringVar(&logLevel, "log-level", "warning", "log level (debug, info, warning, error)")
+	// idle-timeout: if no data is received from the server for this long,
+	// the tunnel session is considered dead and the client will reconnect.
+	// Lower values detect broken connections faster but may cause spurious
+	// reconnects on slow or lossy DNS paths. Accepts Go duration strings
+	// like "10s", "500ms", "1m30s".
+	flag.StringVar(&idleTimeoutStr, "idle-timeout", defaultIdleTimeout.String(), "session idle timeout (e.g. 10s, 1m); reconnects if no data received within this period")
+	// udp-timeout: how long each UDP worker waits for a DNS response after
+	// sending a query. If no response arrives, the query is considered lost.
+	flag.StringVar(&udpTimeoutStr, "udp-timeout", defaultUDPResponseTimeout.String(), "per-query UDP response timeout (e.g. 2s, 500ms)")
+	// udp-ignore-errors: when true, non-NOERROR DNS responses (SERVFAIL,
+	// NXDOMAIN, REFUSED, etc.) are silently dropped, assuming they are
+	// forged by censorship. The worker keeps waiting for a real response
+	// until udp-timeout. When false, all responses are passed through.
+	flag.BoolVar(&udpIgnoreErrors, "udp-ignore-errors", true, "ignore DNS error responses in UDP mode (filter forged/censored replies)")
 	flag.Parse()
 
 	// Configure logrus
@@ -360,6 +444,17 @@ Known TLS fingerprints for -utls are:
 		FullTimestamp:   true,
 		TimestampFormat: "2006-01-02 15:04:05",
 	})
+
+	idleTimeout, err := time.ParseDuration(idleTimeoutStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -idle-timeout %q: %v\n", idleTimeoutStr, err)
+		os.Exit(1)
+	}
+	udpTimeout, err := time.ParseDuration(udpTimeoutStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -udp-timeout %q: %v\n", udpTimeoutStr, err)
+		os.Exit(1)
+	}
 
 	if flag.NArg() != 2 {
 		flag.Usage()
@@ -483,7 +578,7 @@ Known TLS fingerprints for -utls are:
 				pconn, err = lc.ListenPacket(context.Background(), "udp", ":0")
 			} else {
 				// New behavior: multiple workers with per-query sockets
-				pconn, err = NewUDPPacketConn(addr, dialerControl, udpWorkers)
+				pconn, err = NewUDPPacketConn(addr, dialerControl, udpWorkers, udpTimeout, udpIgnoreErrors)
 			}
 			return addr, pconn, err
 		}},
@@ -512,7 +607,7 @@ Known TLS fingerprints for -utls are:
 		log.Infof("rate limiting DNS queries to %.2f requests per second", rpsLimit)
 	}
 	pconn = NewDNSPacketConn(pconn, remoteAddr, domains, rateLimiter, maxQnameLen, maxNumLabels)
-	err = run(pubkey, domains, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels)
+	err = run(pubkey, domains, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout)
 	if err != nil {
 		log.Fatal(err)
 	}

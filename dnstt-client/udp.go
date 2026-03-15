@@ -2,18 +2,13 @@ package main
 
 import (
 	"context"
-	"log"
 	"net"
 	"syscall"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
-)
-
-const (
-	// Timeout for waiting for a UDP response after sending a query.
-	udpResponseTimeout = 10 * time.Second
 )
 
 // UDPPacketConn is a UDP-based transport for DNS messages. Its WriteTo and
@@ -31,6 +26,15 @@ type UDPPacketConn struct {
 	// creating new UDP sockets.
 	dialerControl func(network, address string, c syscall.RawConn) error
 
+	// responseTimeout is how long to wait for a UDP response per query.
+	responseTimeout time.Duration
+
+	// ignoreErrors controls whether to filter out non-NOERROR DNS responses.
+	// When true (default), error responses (SERVFAIL, NXDOMAIN, etc.) are
+	// skipped and the worker waits for a NOERROR response until timeout.
+	// When false, all responses are passed through regardless of RCODE.
+	ignoreErrors bool
+
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// sendLoop workers remove messages from the outgoing queue that were
 	// placed there by WriteTo, and insert messages into the incoming queue
@@ -41,12 +45,14 @@ type UDPPacketConn struct {
 // NewUDPPacketConn creates a new UDPPacketConn configured to send queries to
 // remoteAddr. It creates numWorkers concurrent worker goroutines, each of
 // which creates a new UDP socket for each query to randomize the source port.
-// dialerControl is an optional function to control socket options when
-// creating new UDP sockets.
-func NewUDPPacketConn(remoteAddr net.Addr, dialerControl func(network, address string, c syscall.RawConn) error, numWorkers int) (*UDPPacketConn, error) {
+// responseTimeout controls how long each worker waits for a response.
+// ignoreErrors controls whether to filter out non-NOERROR DNS responses.
+func NewUDPPacketConn(remoteAddr net.Addr, dialerControl func(network, address string, c syscall.RawConn) error, numWorkers int, responseTimeout time.Duration, ignoreErrors bool) (*UDPPacketConn, error) {
 	c := &UDPPacketConn{
 		remoteAddr:      remoteAddr,
 		dialerControl:   dialerControl,
+		responseTimeout: responseTimeout,
+		ignoreErrors:    ignoreErrors,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(remoteAddr, 0),
 	}
 	for i := 0; i < numWorkers; i++ {
@@ -68,23 +74,20 @@ func (c *UDPPacketConn) sendLoop() {
 		}
 		conn, err := lc.ListenPacket(context.Background(), "udp", ":0")
 		if err != nil {
-			log.Printf("sendLoop: ListenPacket: %v", err)
+			log.Warnf("sendLoop: ListenPacket: %v", err)
 			continue
 		}
 
 		// Send the query.
 		_, err = conn.WriteTo(p, c.remoteAddr)
 		if err != nil {
-			log.Printf("sendLoop: WriteTo: %v", err)
+			log.Warnf("sendLoop: WriteTo: %v", err)
 			conn.Close()
 			continue
 		}
 
-		// Read responses on this socket until we get a valid one or
-		// timeout. This loop exists to skip past forged responses
-		// (e.g. SERVFAIL/REFUSED injected by censorship) and wait
-		// for the real response from the resolver.
-		deadline := time.Now().Add(udpResponseTimeout)
+		// Read responses on this socket until we get a valid one or timeout.
+		deadline := time.Now().Add(c.responseTimeout)
 		conn.SetReadDeadline(deadline)
 		var buf [4096]byte
 		for {
@@ -94,20 +97,20 @@ func (c *UDPPacketConn) sendLoop() {
 				break
 			}
 
-			// Quick RCODE check: if the response has an error
-			// RCODE, it's likely injected by a censor. Skip it
-			// and keep waiting for the real response.
-			resp, parseErr := dns.MessageFromWireFormat(buf[:n])
-			if parseErr == nil && resp.Flags&0x8000 != 0 {
-				// It's a response (QR=1). Check RCODE.
-				rcode := resp.Rcode()
-				if rcode != dns.RcodeNoError {
-					log.Printf("UDP: skipping injected response (RCODE=%d), waiting for real response", rcode)
-					continue
+			if c.ignoreErrors {
+				// Filter mode: skip non-NOERROR responses (likely
+				// forged by censorship) and wait for the real one.
+				resp, parseErr := dns.MessageFromWireFormat(buf[:n])
+				if parseErr == nil && resp.Flags&0x8000 != 0 {
+					rcode := resp.Rcode()
+					if rcode != dns.RcodeNoError {
+						log.Debugf("UDP: skipping error response (RCODE=%d), waiting for real response", rcode)
+						continue
+					}
 				}
 			}
 
-			// Valid response (RCODE=0) or unparseable — queue it.
+			// Pass through: queue the response.
 			c.QueuePacketConn.QueueIncoming(buf[:n], c.remoteAddr)
 			break
 		}
