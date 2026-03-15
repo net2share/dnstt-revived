@@ -65,7 +65,8 @@ import (
 // Default timeout values, overridable via CLI flags.
 const (
 	defaultIdleTimeout        = 10 * time.Second
-	defaultUDPResponseTimeout = 2 * time.Second
+	defaultKeepAlive          = 2 * time.Second
+	defaultUDPResponseTimeout = 200 * time.Millisecond
 )
 
 // dnsNameCapacity returns the number of raw bytes that can be encoded in a DNS
@@ -193,7 +194,7 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 // createTunnelSession creates a new KCP + Noise + smux session on top of the
 // given packet conn. The caller is responsible for closing the returned session
 // and KCP connection.
-func createTunnelSession(pconn net.PacketConn, remoteAddr net.Addr, pubkey []byte, mtu int, idleTimeout time.Duration) (*kcp.UDPSession, *smux.Session, error) {
+func createTunnelSession(pconn net.PacketConn, remoteAddr net.Addr, pubkey []byte, mtu int, idleTimeout time.Duration, keepAlive time.Duration) (*kcp.UDPSession, *smux.Session, error) {
 	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening KCP conn: %v", err)
@@ -229,6 +230,10 @@ func createTunnelSession(pconn net.PacketConn, remoteAddr net.Addr, pubkey []byt
 	log.Debugf("creating smux session...")
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
+	// KeepAliveInterval: how often to send keepalive pings.
+	// KeepAliveTimeout: session is dead if no response within this period.
+	// keepAlive must be < idleTimeout so multiple pings are sent before timeout.
+	smuxConfig.KeepAliveInterval = keepAlive
 	smuxConfig.KeepAliveTimeout = idleTimeout
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Client(rw, smuxConfig)
@@ -251,7 +256,7 @@ const (
 	reconnectMaxDelay  = 2 * time.Minute
 )
 
-func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration) error {
+func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration, keepAlive time.Duration) error {
 	defer pconn.Close()
 
 	ln, err := net.ListenTCP("tcp", localAddr)
@@ -293,7 +298,7 @@ func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr n
 		var sess *smux.Session
 		delay := reconnectInitDelay
 		for {
-			conn, sess, err = createTunnelSession(pconn, remoteAddr, pubkey, mtu, idleTimeout)
+			conn, sess, err = createTunnelSession(pconn, remoteAddr, pubkey, mtu, idleTimeout, keepAlive)
 			if err == nil {
 				break
 			}
@@ -411,6 +416,7 @@ Known TLS fingerprints for -utls are:
 	var udpSharedSocket bool
 	var logLevel string
 	var idleTimeoutStr string
+	var keepAliveStr string
 	var udpTimeoutStr string
 	var udpIgnoreErrors bool
 	flag.IntVar(&maxQnameLen, "max-qname-len", 101, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
@@ -424,6 +430,10 @@ Known TLS fingerprints for -utls are:
 	// reconnects on slow or lossy DNS paths. Accepts Go duration strings
 	// like "10s", "500ms", "1m30s".
 	flag.StringVar(&idleTimeoutStr, "idle-timeout", defaultIdleTimeout.String(), "session idle timeout (e.g. 10s, 1m); reconnects if no data received within this period")
+	// keepalive: how often smux sends keepalive pings to detect dead sessions.
+	// Must be shorter than idle-timeout so multiple pings are attempted
+	// before the session is declared dead.
+	flag.StringVar(&keepAliveStr, "keepalive", defaultKeepAlive.String(), "keepalive ping interval (e.g. 2s, 500ms); must be less than idle-timeout")
 	// udp-timeout: how long each UDP worker waits for a DNS response after
 	// sending a query. If no response arrives, the query is considered lost.
 	flag.StringVar(&udpTimeoutStr, "udp-timeout", defaultUDPResponseTimeout.String(), "per-query UDP response timeout (e.g. 2s, 500ms)")
@@ -448,6 +458,15 @@ Known TLS fingerprints for -utls are:
 	idleTimeout, err := time.ParseDuration(idleTimeoutStr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid -idle-timeout %q: %v\n", idleTimeoutStr, err)
+		os.Exit(1)
+	}
+	keepAlive, err := time.ParseDuration(keepAliveStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -keepalive %q: %v\n", keepAliveStr, err)
+		os.Exit(1)
+	}
+	if keepAlive >= idleTimeout {
+		fmt.Fprintf(os.Stderr, "-keepalive (%s) must be less than -idle-timeout (%s)\n", keepAlive, idleTimeout)
 		os.Exit(1)
 	}
 	udpTimeout, err := time.ParseDuration(udpTimeoutStr)
@@ -607,7 +626,7 @@ Known TLS fingerprints for -utls are:
 		log.Infof("rate limiting DNS queries to %.2f requests per second", rpsLimit)
 	}
 	pconn = NewDNSPacketConn(pconn, remoteAddr, domains, rateLimiter, maxQnameLen, maxNumLabels)
-	err = run(pubkey, domains, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout)
+	err = run(pubkey, domains, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout, keepAlive)
 	if err != nil {
 		log.Fatal(err)
 	}

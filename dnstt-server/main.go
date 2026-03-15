@@ -78,6 +78,11 @@ const (
 	// via -idle-timeout. Should match the client's -idle-timeout value.
 	defaultIdleTimeout = 10 * time.Second
 
+	// Default keepalive interval: how often smux sends keepalive pings.
+	// Must be shorter than idleTimeout so multiple pings are attempted
+	// before timeout. Should match the client's -keepalive value.
+	defaultKeepAlive = 2 * time.Second
+
 	// How to set the TTL field in Answer resource records.
 	responseTTL = 60
 
@@ -255,7 +260,7 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTimeout time.Duration) error {
+func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTimeout time.Duration, keepAlive time.Duration) error {
 	// Put a Noise channel on top of the KCP conn.
 	rw, err := noise.NewServer(conn, privkey)
 	if err != nil {
@@ -265,6 +270,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTi
 	// Put an smux session on top of the encrypted Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
+	smuxConfig.KeepAliveInterval = keepAlive
 	smuxConfig.KeepAliveTimeout = idleTimeout
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Server(rw, smuxConfig)
@@ -297,7 +303,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTi
 
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, idleTimeout time.Duration) error {
+func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, idleTimeout time.Duration, keepAlive time.Duration) error {
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
@@ -326,7 +332,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, 
 				log.Debugf("end session %08x", conn.GetConv())
 				conn.Close()
 			}()
-			err := acceptStreams(conn, privkey, upstream, idleTimeout)
+			err := acceptStreams(conn, privkey, upstream, idleTimeout, keepAlive)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				log.Warnf("session %08x acceptStreams: %v", conn.GetConv(), err)
 			}
@@ -939,7 +945,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, idleTimeout time.Duration) error {
+func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, idleTimeout time.Duration, keepAlive time.Duration) error {
 	defer dnsConn.Close()
 
 	log.Infof("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -970,7 +976,7 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 	}
 	defer ln.Close()
 	go func() {
-		err := acceptSessions(ln, privkey, mtu, upstream, idleTimeout)
+		err := acceptSessions(ln, privkey, mtu, upstream, idleTimeout, keepAlive)
 		if err != nil {
 			log.Warnf("acceptSessions: %v", err)
 		}
@@ -1039,12 +1045,16 @@ Example:
 	flag.StringVar(&fallbackAddrString, "fallback", "", "UDP endpoint to forward non-DNS packets to (e.g., 127.0.0.1:8888)")
 	var logLevel string
 	var idleTimeoutStr string
+	var keepAliveStr string
 	flag.StringVar(&logLevel, "log-level", "warning", "log level (debug, info, warning, error)")
 	// idle-timeout: if no data is received from a client for this long,
 	// the tunnel session is considered dead and torn down. Should match
 	// the client's -idle-timeout. Accepts Go duration strings like
 	// "10s", "500ms", "1m30s".
 	flag.StringVar(&idleTimeoutStr, "idle-timeout", defaultIdleTimeout.String(), "session idle timeout (e.g. 10s, 1m); tears down sessions with no data within this period")
+	// keepalive: how often smux sends keepalive pings. Must be shorter than
+	// idle-timeout. Should match the client's -keepalive value.
+	flag.StringVar(&keepAliveStr, "keepalive", defaultKeepAlive.String(), "keepalive ping interval (e.g. 2s, 500ms); must be less than idle-timeout")
 	flag.Parse()
 
 	// Configure logrus
@@ -1061,6 +1071,15 @@ Example:
 	idleTimeout, err := time.ParseDuration(idleTimeoutStr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid -idle-timeout %q: %v\n", idleTimeoutStr, err)
+		os.Exit(1)
+	}
+	keepAlive, err := time.ParseDuration(keepAliveStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -keepalive %q: %v\n", keepAliveStr, err)
+		os.Exit(1)
+	}
+	if keepAlive >= idleTimeout {
+		fmt.Fprintf(os.Stderr, "-keepalive (%s) must be less than -idle-timeout (%s)\n", keepAlive, idleTimeout)
 		os.Exit(1)
 	}
 
@@ -1187,7 +1206,7 @@ Example:
 			}
 		}
 
-		err = run(privkey, domains, upstream, dnsConn, fallbackAddr, idleTimeout)
+		err = run(privkey, domains, upstream, dnsConn, fallbackAddr, idleTimeout, keepAlive)
 		if err != nil {
 			log.Fatal(err)
 		}
