@@ -148,10 +148,28 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 	return ids[sampleWeighted(weights)], nil
 }
 
+const openStreamTimeout = 10 * time.Second
+
+type streamResult struct {
+	stream *smux.Stream
+	err    error
+}
+
 func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
-	stream, err := sess.OpenStream()
-	if err != nil {
-		return fmt.Errorf("session %08x opening stream: %v", conv, err)
+	ch := make(chan streamResult, 1)
+	go func() {
+		s, err := sess.OpenStream()
+		ch <- streamResult{s, err}
+	}()
+	var stream *smux.Stream
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return fmt.Errorf("session %08x opening stream: %v", conv, r.err)
+		}
+		stream = r.stream
+	case <-time.After(openStreamTimeout):
+		return fmt.Errorf("session %08x opening stream: timed out after %v", conv, openStreamTimeout)
 	}
 	defer func() {
 		log.Debugf("end stream %08x:%d", conv, stream.ID())
@@ -188,7 +206,7 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	}()
 	wg.Wait()
 
-	return err
+	return nil
 }
 
 // createTunnelSession creates a new KCP + Noise + smux session on top of the
@@ -249,14 +267,14 @@ func createTunnelSession(pconn net.PacketConn, remoteAddr net.Addr, pubkey []byt
 
 const (
 	// How often to check session health when no new connections arrive.
-	sessionCheckInterval = 5 * time.Second
+	sessionCheckInterval = 1 * time.Second
 
 	// Reconnection backoff parameters.
 	reconnectInitDelay = 5 * time.Second
 	reconnectMaxDelay  = 2 * time.Minute
 )
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration, keepAlive time.Duration) error {
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration, keepAlive time.Duration, maxStreams int, transportErrCh <-chan error) error {
 	defer pconn.Close()
 
 	ln, err := net.ListenTCP("tcp", localAddr)
@@ -264,6 +282,13 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		return fmt.Errorf("opening local listener: %v", err)
 	}
 	defer ln.Close()
+
+	// Stream concurrency semaphore.
+	var sem chan struct{}
+	if maxStreams > 0 {
+		sem = make(chan struct{}, maxStreams)
+		log.Infof("max concurrent streams: %d", maxStreams)
+	}
 
 	// Calculate MTU overhead:
 	// - ClientID: 2 bytes
@@ -303,6 +328,8 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 			}
 		}
 
+		sessDone := sess.CloseChan()
+
 		// Inner loop: accept local connections and proxy them through the
 		// current session. Periodically check if the session is still alive.
 		sessionAlive := true
@@ -311,10 +338,15 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 			local, err := ln.Accept()
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					// Periodic health check.
-					if sess.IsClosed() {
+					// Check for session death or transport errors.
+					select {
+					case <-sessDone:
 						log.Warnf("tunnel session %08x died, reconnecting...", conn.GetConv())
 						sessionAlive = false
+					case terr := <-transportErrCh:
+						log.Warnf("transport error on session %08x: %v, reconnecting...", conn.GetConv(), terr)
+						sessionAlive = false
+					default:
 					}
 					continue
 				}
@@ -328,14 +360,20 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 			}
 
 			// Check session before spawning handler.
-			if sess.IsClosed() {
+			select {
+			case <-sessDone:
 				local.Close()
 				log.Warnf("tunnel session %08x died, reconnecting...", conn.GetConv())
 				sessionAlive = false
 				continue
+			default:
 			}
 
 			go func() {
+				if sem != nil {
+					sem <- struct{}{}
+					defer func() { <-sem }()
+				}
 				defer local.Close()
 				err := handle(local.(*net.TCPConn), sess, conn.GetConv())
 				if err != nil {
@@ -414,6 +452,8 @@ Known TLS fingerprints for -utls are:
 	var keepAliveStr string
 	var udpTimeoutStr string
 	var udpIgnoreErrors bool
+	var maxStreams int
+	flag.IntVar(&maxStreams, "max-streams", 256, "maximum number of concurrent streams (0 = unlimited)")
 	flag.IntVar(&maxQnameLen, "max-qname-len", 101, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
 	flag.IntVar(&maxNumLabels, "max-num-labels", 0, "maximum number of data labels (0 = unlimited)")
 	flag.IntVar(&udpWorkers, "udp-workers", 100, "number of concurrent UDP worker goroutines")
@@ -614,8 +654,9 @@ Known TLS fingerprints for -utls are:
 	if rateLimiter != nil {
 		log.Infof("rate limiting DNS queries to %.2f requests per second", rpsLimit)
 	}
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, rateLimiter, maxQnameLen, maxNumLabels)
-	err = run(pubkey, domain, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout, keepAlive)
+	dnsPconn := NewDNSPacketConn(pconn, remoteAddr, domain, rateLimiter, maxQnameLen, maxNumLabels)
+	pconn = dnsPconn
+	err = run(pubkey, domain, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout, keepAlive, maxStreams, dnsPconn.TransportErrors())
 	if err != nil {
 		log.Fatal(err)
 	}

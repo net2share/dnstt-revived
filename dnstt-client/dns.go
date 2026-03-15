@@ -136,6 +136,9 @@ type DNSPacketConn struct {
 	countSuccess uint64
 	// countOtherError tracks other error responses.
 	countOtherError uint64
+	// transportErr receives fatal errors from recvLoop/sendLoop so the
+	// caller can detect transport death without polling.
+	transportErr chan error
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -163,21 +166,36 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, 
 		rateLimiter:     rateLimiter,
 		maxQnameLen:     maxQnameLen,
 		maxNumLabels:    maxNumLabels,
+		transportErr:    make(chan error, 2),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
 		err := c.recvLoop(transport)
 		if err != nil {
 			log.Errorf("recvLoop: %v", err)
+			select {
+			case c.transportErr <- fmt.Errorf("recvLoop: %w", err):
+			default:
+			}
 		}
 	}()
 	go func() {
 		err := c.sendLoop(transport, addr)
 		if err != nil {
 			log.Errorf("sendLoop: %v", err)
+			select {
+			case c.transportErr <- fmt.Errorf("sendLoop: %w", err):
+			default:
+			}
 		}
 	}()
 	return c
+}
+
+// TransportErrors returns a channel that receives fatal errors from the
+// underlying recvLoop/sendLoop goroutines.
+func (c *DNSPacketConn) TransportErrors() <-chan error {
+	return c.transportErr
 }
 
 // dnsResponsePayload extracts the downstream payload of a DNS response, encoded
