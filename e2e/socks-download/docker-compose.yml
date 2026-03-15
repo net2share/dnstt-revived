@@ -1,0 +1,83 @@
+networks:
+  dns-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  backend-net:
+
+volumes:
+  keys:
+
+services:
+  keygen:
+    build:
+      context: ../..
+      dockerfile: e2e/Dockerfile
+    volumes:
+      - keys:/keys
+    command: >
+      sh -c "dnstt-server -gen-key -privkey-file /keys/server.key -pubkey-file /keys/server.pub"
+
+  dns:
+    image: coredns/coredns
+    networks:
+      dns-net:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - ../Corefile:/Corefile
+    command: ["-conf", "/Corefile"]
+
+  socks:
+    image: serjs/go-socks5-proxy
+    environment:
+      - PROXY_USER=user
+      - PROXY_PASSWORD=pass
+    networks:
+      - backend-net
+
+  heavy:
+    image: nginx:alpine
+    networks:
+      - backend-net
+    entrypoint:
+      - sh
+      - -c
+      - |
+        dd if=/dev/urandom of=/usr/share/nginx/html/bigfile bs=1M count=10
+        exec nginx -g 'daemon off;'
+
+  server:
+    build:
+      context: ../..
+      dockerfile: e2e/Dockerfile
+    networks:
+      dns-net:
+        ipv4_address: 172.28.0.30
+      backend-net:
+    volumes:
+      - keys:/keys
+    command: >
+      dnstt-server -udp :53 -privkey-file /keys/server.key
+      -domain s.example.com -upstream socks:1080
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+      dns:
+        condition: service_started
+      socks:
+        condition: service_started
+
+  client:
+    build:
+      context: ../..
+      dockerfile: e2e/Dockerfile
+    networks:
+      - dns-net
+    volumes:
+      - keys:/keys
+    command: >
+      dnstt-client -udp 172.28.0.10:53 -pubkey-file /keys/server.pub
+      -domain s.example.com -listen 0.0.0.0:7000
+    depends_on:
+      server:
+        condition: service_started

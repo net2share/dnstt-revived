@@ -11,7 +11,7 @@ volumes:
 services:
   keygen:
     build:
-      context: ..
+      context: ../..
       dockerfile: e2e/Dockerfile
     volumes:
       - keys:/keys
@@ -24,47 +24,8 @@ services:
       dns-net:
         ipv4_address: 172.28.0.10
     volumes:
-      - ./Corefile:/Corefile
+      - ../Corefile:/Corefile
     command: ["-conf", "/Corefile"]
-
-  backend:
-    image: nginx:alpine
-    networks:
-      - backend-net
-
-  server:
-    build:
-      context: ..
-      dockerfile: e2e/Dockerfile
-    networks:
-      dns-net:
-        ipv4_address: 172.28.0.20
-      backend-net:
-    volumes:
-      - keys:/keys
-    command: >
-      dnstt-server -udp :53 -privkey-file /keys/server.key
-      -domain t.example.com -upstream backend:80
-    depends_on:
-      keygen:
-        condition: service_completed_successfully
-      dns:
-        condition: service_started
-
-  client:
-    build:
-      context: ..
-      dockerfile: e2e/Dockerfile
-    networks:
-      - dns-net
-    volumes:
-      - keys:/keys
-    command: >
-      dnstt-client -udp 172.28.0.10:53 -pubkey-file /keys/server.pub
-      -domain t.example.com -listen 0.0.0.0:7000
-    depends_on:
-      server:
-        condition: service_started
 
   socks:
     image: serjs/go-socks5-proxy
@@ -83,12 +44,11 @@ services:
       - -c
       - |
         dd if=/dev/urandom of=/usr/share/nginx/html/bigfile bs=1M count=10
-        dd if=/dev/urandom of=/usr/share/nginx/html/bigfile2 bs=1M count=10
         exec nginx -g 'daemon off;'
 
-  server-socks:
+  server:
     build:
-      context: ..
+      context: ../..
       dockerfile: e2e/Dockerfile
     networks:
       dns-net:
@@ -107,9 +67,9 @@ services:
       socks:
         condition: service_started
 
-  client-socks:
+  client:
     build:
-      context: ..
+      context: ../..
       dockerfile: e2e/Dockerfile
     networks:
       - dns-net
@@ -119,5 +79,5 @@ services:
       dnstt-client -udp 172.28.0.10:53 -pubkey-file /keys/server.pub
       -domain s.example.com -listen 0.0.0.0:7000
     depends_on:
-      server-socks:
+      server:
         condition: service_started
