@@ -116,9 +116,7 @@ func (rl *RateLimiter) Wait() {
 // receiving a response, we ignore the ID.
 type DNSPacketConn struct {
 	clientID turbotunnel.ClientID
-	domains  []dns.Name
-	// domainIndex is an atomic counter for round-robin domain selection.
-	domainIndex uint32
+	domain   dns.Name
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
@@ -151,7 +149,7 @@ type DNSPacketConn struct {
 // nil, limits the rate of outgoing DNS queries.
 // maxQnameLen is the max total QNAME length (0 = 253 per RFC 1035).
 // maxNumLabels is the max number of data labels (0 = unlimited).
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domains []dns.Name, rateLimiter *RateLimiter, maxQnameLen int, maxNumLabels int) *DNSPacketConn {
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, rateLimiter *RateLimiter, maxQnameLen int, maxNumLabels int) *DNSPacketConn {
 	// Default to RFC 1035 maximum if not specified
 	if maxQnameLen <= 0 || maxQnameLen > 253 {
 		maxQnameLen = 253
@@ -160,7 +158,7 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domains []dns.Nam
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
 		clientID:        clientID,
-		domains:         domains,
+		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
 		rateLimiter:     rateLimiter,
 		maxQnameLen:     maxQnameLen,
@@ -186,7 +184,7 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domains []dns.Nam
 // into the RDATA of a TXT RR. It returns (payload, false) on success,
 // (nil, true) if the response has error flags (likely forged by firewall),
 // or (nil, false) if the message doesn't pass other format checks.
-func dnsResponsePayload(resp *dns.Message, domains []dns.Name) ([]byte, bool) {
+func dnsResponsePayload(resp *dns.Message, domain dns.Name) ([]byte, bool) {
 	if resp.Flags&0x8000 != 0x8000 {
 		// QR != 1, this is not a response.
 		return nil, false
@@ -202,16 +200,8 @@ func dnsResponsePayload(resp *dns.Message, domains []dns.Name) ([]byte, bool) {
 	}
 	answer := resp.Answer[0]
 
-	// Check if the answer matches any of our domains
-	var matchedDomain bool
-	for _, domain := range domains {
-		_, ok := answer.Name.TrimSuffix(domain)
-		if ok {
-			matchedDomain = true
-			break
-		}
-	}
-	if !matchedDomain {
+	_, ok := answer.Name.TrimSuffix(domain)
+	if !ok {
 		// Not the name we are expecting.
 		return nil, false
 	}
@@ -299,7 +289,7 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			continue
 		}
 
-		payload, isForged := dnsResponsePayload(&resp, c.domains)
+		payload, isForged := dnsResponsePayload(&resp, c.domain)
 		if isForged {
 			// Forged response detected (has error flags) - likely from firewall
 			rcode := resp.Rcode()
@@ -403,9 +393,7 @@ func chunks(p []byte, n int) [][]byte {
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	const labelLen = 63 // DNS maximum label size
 
-	// Round-robin domain selection - select domain first to calculate capacity
-	domainIdx := atomic.AddUint32(&c.domainIndex, 1) % uint32(len(c.domains))
-	domain := c.domains[domainIdx]
+	domain := c.domain
 
 	// Calculate domain wire length (each label: 1 length byte + content)
 	domainWireLen := 0

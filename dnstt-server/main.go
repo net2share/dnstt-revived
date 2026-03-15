@@ -3,16 +3,16 @@
 // Usage:
 //
 //	dnstt-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
-//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-fallback FALLBACKADDR] DOMAIN UPSTREAMADDR
+//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-fallback FALLBACKADDR] -domain DOMAIN -upstream UPSTREAMADDR
 //
 // Example:
 //
 //	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
-//	dnstt-server -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+//	dnstt-server -udp :53 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 //
 // With fallback for non-DNS traffic:
 //
-//	dnstt-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 t.example.com 127.0.0.1:8000
+//	dnstt-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 -domain t.example.com -upstream 127.0.0.1:8000
 //
 // To generate a persistent server private key, first run with the -gen-key
 // option. By default the generated private and public keys are printed to
@@ -40,11 +40,11 @@
 // This acts as a simple UDP proxy for non-DNS traffic, allowing another
 // service to run on the same port.
 //
-// DOMAIN is the root of the DNS zone reserved for the tunnel. See README for
-// instructions on setting it up.
+// The -domain option specifies the root of the DNS zone reserved for the
+// tunnel. See README for instructions on setting it up.
 //
-// UPSTREAMADDR is the TCP address to which incoming tunnelled streams will be
-// forwarded.
+// The -upstream option specifies the TCP address to which incoming tunnelled
+// streams will be forwarded.
 package main
 
 import (
@@ -58,7 +58,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -373,7 +372,7 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) {
+func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -443,29 +442,18 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte) 
 		return resp, nil
 	}
 	question := query.Question[0]
-	// Check the name to see if it ends in any of our chosen domains, and extract
+	// Check the name to see if it ends in our domain, and extract
 	// all that comes before the domain if it does. If it does not, we will
 	// return RcodeNameError below, but prefer to return RcodeFormatError
 	// for payload size if that applies as well.
-	var prefix [][]byte
-	var matchedDomain bool
-	var matchedDomainName dns.Name
-	for _, domain := range domains {
-		var ok bool
-		prefix, ok = question.Name.TrimSuffix(domain)
-		if ok {
-			matchedDomain = true
-			matchedDomainName = domain
-			break
-		}
-	}
-	if !matchedDomain {
+	prefix, ok := question.Name.TrimSuffix(domain)
+	if !ok {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
 		log.Debugf("NXDOMAIN: not authoritative for %s", question.Name)
 		return resp, nil
 	}
-	log.Debugf(" domain: QNAME=%s matched=%s prefixLabels=%d", question.Name.String(), matchedDomainName.String(), len(prefix))
+	log.Debugf(" domain: QNAME=%s matched=%s prefixLabels=%d", question.Name.String(), domain.String(), len(prefix))
 	resp.Flags |= 0x0400 // AA = 1
 
 	if query.Opcode() != 0 {
@@ -654,7 +642,7 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
-func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -679,7 +667,7 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 			continue
 		}
 
-		resp, payload := responseFor(&query, domains)
+		resp, payload := responseFor(&query, domain)
 		// DEBUG: Log payload
 		log.Debugf(" recv: payload=%d bytes from %s", len(payload), addr)
 
@@ -912,7 +900,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, []dns.Name{dns.Name([][]byte{})})
+	resp, _ := responseFor(query, dns.Name([][]byte{}))
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -945,7 +933,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, idleTimeout time.Duration, keepAlive time.Duration) error {
+func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, idleTimeout time.Duration, keepAlive time.Duration) error {
 	defer dnsConn.Close()
 
 	log.Infof("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -1012,7 +1000,7 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 		}
 	}()
 
-	return recvLoop(domains, dnsConn, ttConn, ch, fallbackMgr)
+	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr)
 }
 
 func main() {
@@ -1022,16 +1010,18 @@ func main() {
 	var pubkeyFilename string
 	var udpAddr string
 	var fallbackAddrString string
+	var domainArg string
+	var upstream string
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  %[1]s -udp ADDR -privkey-file PRIVKEYFILE [-fallback FALLBACKADDR] DOMAIN UPSTREAMADDR
+  %[1]s -udp ADDR -privkey-file PRIVKEYFILE [-fallback FALLBACKADDR] -domain DOMAIN -upstream UPSTREAMADDR
 
 Example:
   %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
-  %[1]s -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
-  %[1]s -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 t.example.com 127.0.0.1:8000
+  %[1]s -udp :53 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
+  %[1]s -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 -domain t.example.com -upstream 127.0.0.1:8000
 
 `, os.Args[0])
 		flag.PrintDefaults()
@@ -1043,6 +1033,8 @@ Example:
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
 	flag.StringVar(&fallbackAddrString, "fallback", "", "UDP endpoint to forward non-DNS packets to (e.g., 127.0.0.1:8888)")
+	flag.StringVar(&domainArg, "domain", "", "tunnel domain (e.g., t.example.com)")
+	flag.StringVar(&upstream, "upstream", "", "TCP address to forward tunneled connections to (e.g., 127.0.0.1:8000)")
 	var logLevel string
 	var idleTimeoutStr string
 	var keepAliveStr string
@@ -1085,7 +1077,7 @@ Example:
 
 	if genKey {
 		// -gen-key mode.
-		if flag.NArg() != 0 || privkeyString != "" || udpAddr != "" || fallbackAddrString != "" {
+		if flag.NArg() != 0 || privkeyString != "" || udpAddr != "" || fallbackAddrString != "" || domainArg != "" || upstream != "" {
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -1095,34 +1087,25 @@ Example:
 		}
 	} else {
 		// Ordinary server mode.
-		if flag.NArg() != 2 {
+		if flag.NArg() != 0 {
+			fmt.Fprintf(os.Stderr, "unexpected positional arguments\n")
 			flag.Usage()
 			os.Exit(1)
 		}
-		// Parse comma-separated domains (e.g., "d.example.com,c.example.org")
-		domainsArg := flag.Arg(0)
-		domainStrs := strings.Split(domainsArg, ",")
-		var domains []dns.Name
-		for _, domainStr := range domainStrs {
-			domainStr = strings.TrimSpace(domainStr)
-			if domainStr == "" {
-				continue
-			}
-			domain, err := dns.ParseName(domainStr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", domainStr, err)
-				os.Exit(1)
-			}
-			domains = append(domains, domain)
-		}
-		if len(domains) == 0 {
-			fmt.Fprintf(os.Stderr, "at least one domain is required\n")
+		if domainArg == "" {
+			fmt.Fprintf(os.Stderr, "the -domain option is required\n")
 			os.Exit(1)
 		}
-		for _, domain := range domains {
-			log.Infof("serving domain: %s", domain)
+		if upstream == "" {
+			fmt.Fprintf(os.Stderr, "the -upstream option is required\n")
+			os.Exit(1)
 		}
-		upstream := flag.Arg(1)
+		domain, err := dns.ParseName(domainArg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", domainArg, err)
+			os.Exit(1)
+		}
+		log.Infof("serving domain: %s", domain)
 		// We keep upstream as a string in order to eventually pass it
 		// to net.Dial in handleStream. But for the sake of displaying
 		// an error or warning at startup, rather than only when the
@@ -1206,7 +1189,7 @@ Example:
 			}
 		}
 
-		err = run(privkey, domains, upstream, dnsConn, fallbackAddr, idleTimeout, keepAlive)
+		err = run(privkey, domain, upstream, dnsConn, fallbackAddr, idleTimeout, keepAlive)
 		if err != nil {
 			log.Fatal(err)
 		}

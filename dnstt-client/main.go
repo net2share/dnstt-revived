@@ -2,12 +2,12 @@
 //
 // Usage:
 //
-//	dnstt-client [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE DOMAIN LOCALADDR
+//	dnstt-client [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE -domain DOMAIN -listen LOCALADDR
 //
 // Examples:
 //
-//	dnstt-client -doh https://resolver.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
-//	dnstt-client -dot resolver.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
+//	dnstt-client -doh https://resolver.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+//	dnstt-client -dot resolver.example:853 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 //
 // The program supports DNS over HTTPS (DoH), DNS over TLS (DoT), and UDP DNS.
 // Use one of these options:
@@ -22,11 +22,11 @@
 //	-pubkey-file server.pub
 //	-pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
 //
-// DOMAIN is the root of the DNS zone reserved for the tunnel. See README for
-// instructions on setting it up.
+// The -domain option specifies the root of the DNS zone reserved for the
+// tunnel. See README for instructions on setting it up.
 //
-// LOCALADDR is the TCP address that will listen for connections and forward
-// them over the tunnel.
+// The -listen option specifies the TCP address that will listen for connections
+// and forward them over the tunnel.
 //
 // In -doh and -dot modes, the program's TLS fingerprint is camouflaged with
 // uTLS by default. The specific TLS fingerprint is selected randomly from a
@@ -256,7 +256,7 @@ const (
 	reconnectMaxDelay  = 2 * time.Minute
 )
 
-func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration, keepAlive time.Duration) error {
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration, keepAlive time.Duration) error {
 	defer pconn.Close()
 
 	ln, err := net.ListenTCP("tcp", localAddr)
@@ -268,16 +268,9 @@ func run(pubkey []byte, domains []dns.Name, localAddr *net.TCPAddr, remoteAddr n
 	// Calculate MTU overhead:
 	// - ClientID: 2 bytes
 	// - Data length prefix: 1 byte (only present for data packets, not polls)
-	// Use the longest domain for conservative MTU calculation
-	var longestDomain dns.Name
-	for _, domain := range domains {
-		if len(domain.String()) > len(longestDomain.String()) {
-			longestDomain = domain
-		}
-	}
 	const clientIDSize = 2 // Reduced ClientID size
 	const dataLenSize = 1  // Data length prefix
-	mtu := dnsNameCapacity(longestDomain, maxQnameLen, maxNumLabels) - clientIDSize - dataLenSize
+	mtu := dnsNameCapacity(domain, maxQnameLen, maxNumLabels) - clientIDSize - dataLenSize
 	// KCP requires MTU >= 50 (see kcp.go SetMtu)
 	const kcpMinMTU = 50
 	if mtu < kcpMinMTU {
@@ -368,14 +361,16 @@ func main() {
 	var udpAddr string
 	var utlsDistribution string
 	var rpsLimit float64
+	var domainArg string
+	var listenAddr string
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE DOMAIN LOCALADDR
+  %[1]s [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE -domain DOMAIN -listen LOCALADDR
 
 Examples:
-  %[1]s -doh https://resolver.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
-  %[1]s -dot resolver.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
+  %[1]s -doh https://resolver.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+  %[1]s -dot resolver.example:853 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 
 `, os.Args[0])
 		flag.PrintDefaults()
@@ -442,6 +437,8 @@ Known TLS fingerprints for -utls are:
 	// forged by censorship. The worker keeps waiting for a real response
 	// until udp-timeout. When false, all responses are passed through.
 	flag.BoolVar(&udpIgnoreErrors, "udp-ignore-errors", true, "ignore DNS error responses in UDP mode (filter forged/censored replies)")
+	flag.StringVar(&domainArg, "domain", "", "tunnel domain (e.g., t.example.com)")
+	flag.StringVar(&listenAddr, "listen", "", "TCP address to listen on for local connections (e.g., 127.0.0.1:7000)")
 	flag.Parse()
 
 	// Configure logrus
@@ -475,34 +472,26 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
-	if flag.NArg() != 2 {
+	if flag.NArg() != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected positional arguments\n")
 		flag.Usage()
 		os.Exit(1)
 	}
-	// Parse comma-separated domains (e.g., "d.example.com,c.example.org")
-	domainsArg := flag.Arg(0)
-	domainStrs := strings.Split(domainsArg, ",")
-	var domains []dns.Name
-	for _, domainStr := range domainStrs {
-		domainStr = strings.TrimSpace(domainStr)
-		if domainStr == "" {
-			continue
-		}
-		domain, err := dns.ParseName(domainStr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", domainStr, err)
-			os.Exit(1)
-		}
-		domains = append(domains, domain)
-	}
-	if len(domains) == 0 {
-		fmt.Fprintf(os.Stderr, "at least one domain is required\n")
+	if domainArg == "" {
+		fmt.Fprintf(os.Stderr, "the -domain option is required\n")
 		os.Exit(1)
 	}
-	for _, domain := range domains {
-		log.Infof("using domain: %s", domain)
+	if listenAddr == "" {
+		fmt.Fprintf(os.Stderr, "the -listen option is required\n")
+		os.Exit(1)
 	}
-	localAddr, err := net.ResolveTCPAddr("tcp", flag.Arg(1))
+	domain, err := dns.ParseName(domainArg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", domainArg, err)
+		os.Exit(1)
+	}
+	log.Infof("using domain: %s", domain)
+	localAddr, err := net.ResolveTCPAddr("tcp", listenAddr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -625,8 +614,8 @@ Known TLS fingerprints for -utls are:
 	if rateLimiter != nil {
 		log.Infof("rate limiting DNS queries to %.2f requests per second", rpsLimit)
 	}
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domains, rateLimiter, maxQnameLen, maxNumLabels)
-	err = run(pubkey, domains, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout, keepAlive)
+	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, rateLimiter, maxQnameLen, maxNumLabels)
+	err = run(pubkey, domain, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout, keepAlive)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -78,7 +78,7 @@ DNS packets (`:5300`), the private key file (`server.key`), the root of
 the DNS zone (`t.example.com`), and a TCP address to which incoming
 tunnel streams will be forwarded (`127.0.0.1:8000`).
 ```
-tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key t.example.com 127.0.0.1:8000
+tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 ```
 
 The tunnel server needs to be able to receive packets on an external
@@ -127,12 +127,12 @@ files (`server.pub`), the root of the DNS zone (`t.example.com`), and
 the local TCP port that will receive connections and forward them
 through the tunnel (`127.0.0.1:7000`):
 ```
-tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
+tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 For DoT, it's the same, but use the `-dot` option instead:
 ```
-tunnel-client$ ./dnstt-client -dot dot.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
+tunnel-client$ ./dnstt-client -dot dot.example:853 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 Once the tunnel client is running, you can connect to the local end of
@@ -164,14 +164,14 @@ for example.
 
 ```
 tunnel-server$ ncat -l -k --proxy-type http 127.0.0.1 8000
-tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key t.example.com 127.0.0.1:8000
+tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 ```
 
 On the client, have the tunnel client listen on 127.0.0.1:7000, and configure
 your applications to use 127.0.0.1:7000 as an HTTP proxy.
 
 ```
-tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
+tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 tunnel-client$ curl --proxy http://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
 
@@ -189,11 +189,11 @@ on its own local port 7000.
 ```
 tunnel-server$ ssh -N -D 127.0.0.1:8000 -o NoHostAuthenticationForLocalhost=yes 127.0.0.1
 # Enter the password of the local user on tunnel-server
-tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key t.example.com 127.0.0.1:8000
+tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 ```
 
 ```
-tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
+tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 tunnel-client$ curl --proxy socks5h://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
 
@@ -209,7 +209,7 @@ is set to `yes` (the default value) in sshd_config. Run the tunnel
 server and have it forward directly to the SSH port.
 
 ```
-tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key t.example.com 127.0.0.1:22
+tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:22
 ```
 
 Run the tunnel client with the local listening port at 127.0.0.1:7000.
@@ -218,7 +218,7 @@ it were located at 127.0.0.1:8000. Replace `tunnel-server` with the
 hostname or IP address of the SSH server.
 
 ```
-tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:8000
+tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:8000
 tunnel-client$ ssh -N -D 127.0.0.1:7000 -o HostKeyAlias=tunnel-server -p 8000 127.0.0.1
 tunnel-client$ curl --proxy socks5h://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
@@ -232,11 +232,11 @@ Tor client provides a SOCKS interface that other programs can use. Let's
 say your Tor bridge's ORPort is 9001.
 
 ```
-tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key t.example.com 127.0.0.1:9001
+tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:9001
 ```
 
 ```
-tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
+tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 Add a Bridge line to /etc/tor/torrc, or paste it into Tor Browser. You
@@ -342,8 +342,8 @@ to files. You can then use the keys with `-privkey` on the server and
 $ ./dnstt-server -gen-key
 privkey 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 pubkey  0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
-$ ./dnstt-server -udp :5300 -privkey 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef t.example.com 127.0.0.1:8000
-$ ./dnstt-client -dot dot.example:853 -pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff t.example.com 127.0.0.1:7000
+$ ./dnstt-server -udp :5300 -privkey 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef -domain t.example.com -upstream 127.0.0.1:8000
+$ ./dnstt-client -dot dot.example:853 -pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff -domain t.example.com -listen 127.0.0.1:7000
 ```
 If you run the server without `-privkey-file` or `-privkey`, it will
 generate a temporary keypair and print the public key in the log. But
@@ -368,7 +368,7 @@ to be supported by most resolvers that understand EDNS(0) (RFC 6891).
 For maximum compatibility, set the maximum to 512, but know that doing
 so will reduce downstream bandwidth.
 ```
-$ ./dnstt-server -mtu 512 -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
+$ ./dnstt-server -mtu 512 -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -upstream 127.0.0.1:7000
 ```
 
 The client and server emit an "effective MTU" log line when starting up

@@ -15,23 +15,23 @@
 .Nm
 .Op Fl doh Ar URL | Fl dot Ar HOST : Ns Ar PORT | Fl udp Ar HOST : Ns Ar PORT
 .Op Fl pubkey Ar HEX | Fl pubkey-file Ar FILENAME
-.Ar DOMAIN
-.Ar LOCALADDR : Ns Ar LOCALPORT
+.Fl domain Ar DOMAIN
+.Fl listen Ar LOCALADDR : Ns Ar LOCALPORT
 
 
 .Sh DESCRIPTION
 
 .Nm
 is the client portion of a DNS tunnel.
-It receives TCP connections at
-.Ar LOCALADDR : Ns Ar LOCALPORT
+It receives TCP connections at the address given by
+.Fl listen
 and forwards them,
 encoded as a sequence of DNS messages
 and via a recursive resolver,
 to an instance of
 .Xr dnstt-server 1
-running as the authoritative name server for
-.Ar DOMAIN .
+running as the authoritative name server for the domain given by
+.Fl domain .
 The DNS messages may be carried over
 DNS over HTTPS,
 DNS over TLS,
@@ -91,8 +91,8 @@ you have the option of communicating directly with an instance of
 without going through a recursive resolver.
 That is,
 .Ar HOST : Ns Ar PORT
-may point directly at the authoritative name server for
-.Ar DOMAIN ,
+may point directly at the authoritative name server for the domain given by
+.Fl domain ,
 where
 .Xr dnstt-server 1
 is running.
@@ -198,7 +198,7 @@ Use the server public key stored in the file
 .Cm server.pub .
 
 .Bd -literal -offset indent
-dnstt-client -doh https://resolver.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
+dnstt-client -doh https://resolver.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 .Ed
 
 .Pp
@@ -212,7 +212,7 @@ for connections to forward through the tunnel.
 Use the given hex string as the server public key.
 
 .Bd -literal -offset indent
-dnstt-client -dot resolver.example:853 -pubkey 14ca15f53660e248d289d9302f992c4bee518f2361d6343dafa7b417b5a3d752 t.example.com 127.0.0.1:7000
+dnstt-client -dot resolver.example:853 -pubkey 14ca15f53660e248d289d9302f992c4bee518f2361d6343dafa7b417b5a3d752 -domain t.example.com -listen 127.0.0.1:7000
 .Ed
 
 
@@ -225,8 +225,9 @@ At startup,
 .Nm
 logs the amount of useful payload capacity that can be stored
 in each DNS query, after accounting for the overhead of encoding.
-This number will vary depending on the length of
-.Ar DOMAIN .
+This number will vary depending on the length of the
+.Fl domain
+value.
 
 .Dl effective MTU 128
 

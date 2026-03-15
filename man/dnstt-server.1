@@ -21,8 +21,8 @@
 .Fl udp Ar ADDR : Ns Ar PORT
 .Op Fl privkey Ar HEX | Fl privkey-file Ar FILENAME
 .Op Fl mtu Ar MTU
-.Ar DOMAIN
-.Ar UPSTREAMADDR : Ns Ar UPSTREAMPORT
+.Fl domain Ar DOMAIN
+.Fl upstream Ar UPSTREAMADDR : Ns Ar UPSTREAMPORT
 
 
 .Sh DESCRIPTION
@@ -32,10 +32,10 @@ is the server portion of a DNS tunnel.
 It receives DNS over UDP messages at
 .Ar ADDR : Ns Ar PORT ,
 decodes the streams they contain,
-and forwards the streams as TCP connections to
-.Ar UPSTREAMADDR : Ns Ar UPSTREAMPORT .
-.Nm acts as the authoritative name server for
-.Ar DOMAIN
+and forwards the streams as TCP connections to the address given by
+.Fl upstream .
+.Nm acts as the authoritative name server for the domain given by
+.Fl domain
 and communicates with an instance of
 .Xr dnstt-client 1
 via a recursive resolver.
@@ -178,7 +178,7 @@ the authoritative name server for the domain
 .Cm t.example.com .
 
 .Bd -literal -offset indent
-dnstt-server -udp 127.0.0.1:53 -privkey-file server.key t.example.com 127.0.0.1:8000
+dnstt-server -udp 127.0.0.1:53 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 .Ed
 
 
@@ -202,9 +202,9 @@ At startup,
 .Nm
 logs the amount of useful payload capacity that can be stored
 in each DNS response, after accounting for the overhead of encoding.
-This number will vary depending on the length of
-.Ar DOMAIN
-and the value of
+This number will vary depending on the length of the
+.Fl domain
+value and the value of
 .Ar MTU .
 
 .Dl effective MTU 932
